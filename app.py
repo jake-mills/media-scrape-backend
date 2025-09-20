@@ -2,93 +2,84 @@
 from __future__ import annotations
 
 import os
-import asyncio
+import uuid
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import httpx
+from dotenv import load_dotenv
 
-# ---- Local utilities & providers (these modules already exist in your repo) ----
-from airtable import airtable_exists_by_source_url, airtable_batch_create
-from date_utils import parse_search_dates  # converts "2000-2010" etc. to tuple or None
+# ---- Load env & logging -----------------------------------------------------
+load_dotenv()
 
-# Providers
-from providers.youtube import fetch_youtube_async           # Videos
-from providers.openverse import fetch_openverse_async       # Images
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("media-scrape-backend")
+
+SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
+if not SHORTCUTS_KEY:
+    log.warning("SHORTCUTS_KEY is not set; all requests will be rejected (403).")
+
+# ---- Optional imports: providers & Airtable helpers -------------------------
+# Providers must expose async functions with the signature shown below.
+# - fetch_youtube_async(topic: str, target_count: int, run_id: str, **kw) -> List[Dict]
+# - fetch_openverse_async(topic: str, target_count: int, run_id: str, **kw) -> List[Dict]
 try:
-    # Optional; only used if you include "Archive" in providers + "Images" media mode.
-    from providers.archive import fetch_archive_async       # Images (optional)
-except Exception:  # pragma: no cover
-    fetch_archive_async = None  # gracefully skip if not present
+    from providers.youtube import fetch_youtube_async  # type: ignore
+except Exception as e:
+    fetch_youtube_async = None  # type: ignore
+    log.warning("YouTube provider unavailable: %s", e)
 
+try:
+    from providers.openverse import fetch_openverse_async  # type: ignore
+except Exception as e:
+    fetch_openverse_async = None  # type: ignore
+    log.warning("Openverse provider unavailable: %s", e)
 
-# --------------------------- App & middleware ----------------------------------
+# Airtable utilities expected by the pipeline
+# - airtable_exists_by_source_url(url: str) -> bool
+# - airtable_batch_create(rows: List[Dict[str, Any]]) -> int
+try:
+    from airtable import airtable_exists_by_source_url, airtable_batch_create  # type: ignore
+except Exception as e:
+    airtable_exists_by_source_url = None  # type: ignore
+    airtable_batch_create = None  # type: ignore
+    log.warning("Airtable helpers unavailable: %s", e)
 
-log = logging.getLogger("uvicorn.error")
+# Optional utilities
+try:
+    from normalization import normalize_url  # type: ignore
+except Exception:
+    def normalize_url(u: str) -> str:
+        return (u or "").strip()
 
-app = FastAPI(title="Media Scrape Backend", version="1.3.0")
+# ---- FastAPI app ------------------------------------------------------------
+app = FastAPI(
+    title="Media Scrape Backend",
+    version="1.3.0",
+    description="Scrape images/videos from providers and insert into Airtable.",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # adjust if you want to lock this down
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SHORTCUTS_API_KEY = os.getenv("SHORTCUTS_API_KEY") or os.getenv("SHORTCUTS_APT_KEY") or os.getenv("SHORTCUTS_KEY")
+# ---- Root & health: silence 405s and give quick OKs -------------------------
+@app.get("/")
+async def root_ok():
+    return {"ok": True, "service": "media-scrape-backend"}
 
-
-# ------------------------------ Models -----------------------------------------
-
-class ScrapeRequest(BaseModel):
-    topic: str = Field(..., description="Search topic/keywords")
-    searchDates: Optional[str] = Field(None, description="Year range like '2000-2010'")
-    targetCount: int = Field(1, ge=1, le=50, description="How many results you want (best effort)")
-    providers: Sequence[str] = Field(..., description="e.g., ['YouTube'] or ['Openverse'] or both")
-    mediaMode: str = Field(..., description="'Videos', 'Images', or 'Both'")
-    runId: Optional[str] = Field(None, description="Client-generated ID for correlation")
-
-class InsertedRow(BaseModel):
-    # Echo the minimal shape we return to the client for visibility
-    Title: Optional[str] = None
-    Provider: Optional[str] = None
-    Source_URL: Optional[str] = None
-
-class ScrapeResponse(BaseModel):
-    runId: str
-    requestedTarget: int
-    providers: List[str]
-    mediaMode: str
-    insertedCount: int
-    inserted: List[Dict[str, Any]] = []
-
-
-# -------------------------- Lifespan / shared client ---------------------------
-
-_http: Optional[httpx.AsyncClient] = None
-
-@app.on_event("startup")
-async def _startup():
-    global _http
-    _http = httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=10.0, read=10.0, write=10.0),
-        follow_redirects=True,
-        headers={"User-Agent": "MediaScrape/1.0 (+https://example.invalid)", "Accept": "application/json"},
-    )
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global _http
-    if _http is not None:
-        await _http.aclose()
-        _http = None
-
-
-# ----------------------------- Health & root -----------------------------------
+@app.head("/")
+async def root_head():
+    # empty body, 200 OK
+    return Response(status_code=200)
 
 @app.get("/health")
 async def health_get():
@@ -98,201 +89,171 @@ async def health_get():
 async def health_head():
     return Response(status_code=200)
 
-@app.get("/")
-async def root():
-    # Friendly message instead of 404 when someone opens the root URL in a browser.
-    return {"ok": True, "message": "See /docs for Swagger UI"}
+# ---- Models -----------------------------------------------------------------
+MediaMode = Literal["Videos", "Images", "Both"]
 
+class ScrapeRequest(BaseModel):
+    topic: str = Field(..., description="Search topic/keywords.")
+    searchDates: Optional[str] = Field(
+        None,
+        description="Optional date range string like '2000-2010' (provider support varies).",
+    )
+    targetCount: int = Field(1, ge=1, le=50, description="Desired number of items.")
+    providers: List[str] = Field(..., description="Subset of ['YouTube','Openverse'].")
+    mediaMode: MediaMode
+    runId: Optional[str] = Field(default=None, description="Optional run identifier.")
 
-# --------------------------- Helper functions ----------------------------------
+class ScrapeResult(BaseModel):
+    runId: str
+    requestedTarget: int
+    providers: List[str]
+    mediaMode: MediaMode
+    insertedCount: int
+    inserted: List[Dict[str, Any]]
 
-def _validate_api_key(shortcuts_key: Optional[str]) -> None:
+# ---- Provider registry -------------------------------------------------------
+# Map canonical provider name -> callable
+PROVIDERS: Dict[str, Any] = {}
+if fetch_youtube_async:
+    PROVIDERS["YouTube"] = fetch_youtube_async
+if fetch_openverse_async:
+    PROVIDERS["Openverse"] = fetch_openverse_async
+
+# ---- Helpers ----------------------------------------------------------------
+def require_shortcuts_key(header_val: Optional[str]) -> None:
+    if not SHORTCUTS_KEY:
+        raise HTTPException(status_code=403, detail="Service not configured (SHORTCUTS_KEY).")
+    if not header_val or header_val.strip() != SHORTCUTS_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden (bad X-Shortcuts-Key).")
+
+def want_provider(name: str, mode: MediaMode) -> bool:
+    if mode == "Videos":
+        return name == "YouTube"
+    if mode == "Images":
+        return name == "Openverse"
+    # Both
+    return name in ("YouTube", "Openverse")
+
+def _summarize_for_response(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Enforce the pre-shared header if an env key is configured.
+    Keep the response body compact but useful.
     """
-    if SHORTCUTS_API_KEY:
-        provided = (shortcuts_key or "").strip()
-        if not provided or provided != SHORTCUTS_API_KEY:
-            raise HTTPException(status_code=403, detail="Forbidden")
+    out: List[Dict[str, Any]] = []
+    for r in rows[:10]:
+        out.append(
+            {
+                "Title": r.get("Title", ""),
+                "Provider": r.get("Provider", ""),
+                "Source_URL": r.get("Source URL", ""),
+            }
+        )
+    return out
 
-def _want_videos(media_mode: str) -> bool:
-    return media_mode.lower() in ("videos", "both")
-
-def _want_images(media_mode: str) -> bool:
-    return media_mode.lower() in ("images", "both")
-
-def _is_truthy_provider(name: str, providers: Sequence[str]) -> bool:
-    return any(p.lower() == name.lower() for p in providers)
-
-
-# ------------------------------- Main endpoint ---------------------------------
-
-@app.post("/scrape-and-insert", response_model=ScrapeResponse)
+# ---- Main endpoint -----------------------------------------------------------
+@app.post("/scrape-and-insert", response_model=ScrapeResult)
 async def scrape_and_insert(
-    body: ScrapeRequest,
+    payload: ScrapeRequest,
     request: Request,
-    x_shortcuts_key: Optional[str] = Header(None, convert_underscores=False),
+    x_shortcuts_key: Optional[str] = Header(default=None, convert_underscores=False, alias="X-Shortcuts-Key"),
 ):
-    """
-    Scrape from selected providers, normalize, de-dupe against Airtable by Source URL,
-    and insert new rows. Returns a summary of what was inserted.
-    """
-    _validate_api_key(x_shortcuts_key)
+    # Auth
+    require_shortcuts_key(x_shortcuts_key)
 
-    if _http is None:
-        raise HTTPException(status_code=503, detail="HTTP client not ready")
+    run_id = payload.runId or str(uuid.uuid4())
+    topic = payload.topic.strip()
+    target = int(payload.targetCount)
+    mode: MediaMode = payload.mediaMode
+    requested_providers = [p.strip() for p in payload.providers or []]
 
-    run_id = body.runId or "no-run-id"
-    topic = (body.topic or "").strip()
-    if not topic:
-        raise HTTPException(status_code=422, detail="topic is required")
+    # Decide which providers to call based on mediaMode & user list overlap
+    active: List[str] = []
+    for name in requested_providers:
+        if name in PROVIDERS and want_provider(name, mode):
+            active.append(name)
 
-    # Parse the date range once for providers that support it.
-    # parse_search_dates can return tuple or None; we keep original string, too.
-    search_dates_str = body.searchDates or None
-    _ = parse_search_dates(search_dates_str)  # we keep str; providers can re-parse as needed
+    if not active:
+        # Fallback: default to the provider implied by mediaMode
+        if mode in ("Both", "Videos") and "YouTube" in PROVIDERS:
+            active.append("YouTube")
+        if mode in ("Both", "Images") and "Openverse" in PROVIDERS:
+            active.append("Openverse")
 
-    target = max(1, min(50, int(body.targetCount or 1)))  # clamp to a sane range
+    if not active:
+        raise HTTPException(status_code=422, detail="No usable providers for this request.")
 
-    provider_tasks: List[asyncio.Task] = []
-    collected: List[Dict[str, Any]] = []
-
-    # ------------------- Queue provider tasks (concurrently) -------------------
-
-    # YouTube (Videos)
-    if _want_videos(body.mediaMode) and _is_truthy_provider("YouTube", body.providers):
-        provider_tasks.append(asyncio.create_task(
-            fetch_youtube_async(
-                topic=topic,
-                search_dates=search_dates_str,  # provider can ignore/parse
-                target_count=target,
-                run_id=run_id,
-                client=_http,
-            )
-        ))
-
-    # Openverse (Images)
-    if _want_images(body.mediaMode) and _is_truthy_provider("Openverse", body.providers):
-        provider_tasks.append(asyncio.create_task(
-            fetch_openverse_async(
-                topic=topic,
-                search_dates=search_dates_str,
-                target_count=target,
-                run_id=run_id,
-                client=_http,
-            )
-        ))
-
-    # Internet Archive (optional Images)
-    if fetch_archive_async and _want_images(body.mediaMode) and _is_truthy_provider("Archive", body.providers):
-        provider_tasks.append(asyncio.create_task(
-            fetch_archive_async(
-                topic=topic,
-                search_dates=search_dates_str,
-                target_count=target,
-                run_id=run_id,
-                client=_http,
-            )
-        ))
-
-    # If no valid provider was requested, short-circuit
-    if not provider_tasks:
-        return ScrapeResponse(
-            runId=run_id,
-            requestedTarget=target,
-            providers=list(body.providers),
-            mediaMode=body.mediaMode,
-            insertedCount=0,
-            inserted=[],
-        )
-
-    # ------------------------ Gather & flatten provider results ----------------
-
-    results = await asyncio.gather(*provider_tasks, return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception):
-            log.warning("Provider task failed: %s", r)
+    # Run providers sequentially (keeps logs simpler, avoids provider rate limits)
+    fetched: List[Dict[str, Any]] = []
+    for name in active:
+        fn = PROVIDERS.get(name)
+        if not fn:
+            log.warning("Provider %s missing, skipping.", name)
             continue
-        if isinstance(r, list):
-            collected.extend(r)
 
-    # Nothing fetched
-    if not collected:
-        return ScrapeResponse(
+        try:
+            results: List[Dict[str, Any]] = await fn(
+                topic=topic,
+                target_count=target,
+                run_id=run_id,
+                # Pass optional hints; providers may ignore unsupported ones
+                search_dates=payload.searchDates,
+            )
+            log.info("Provider %s returned %d item(s).", name, len(results))
+            fetched.extend(results)
+        except TypeError as te:
+            # Signature mismatch shows up as unexpected/missing kwarg in your logs;
+            # log and continue so a single provider doesn't kill the run.
+            log.warning("Provider %s failed: %s", name, te)
+        except Exception as e:
+            log.warning("Provider %s unexpected error: %s", name, e)
+
+    if not fetched:
+        return ScrapeResult(
             runId=run_id,
             requestedTarget=target,
-            providers=list(body.providers),
-            mediaMode=body.mediaMode,
+            providers=active,
+            mediaMode=mode,
             insertedCount=0,
             inserted=[],
         )
 
-    # ---------------------- De-dupe by Source URL before insert ----------------
-
+    # De-dup against Airtable and batch insert
     to_insert: List[Dict[str, Any]] = []
-    seen: set[str] = set()
+    if not airtable_exists_by_source_url or not airtable_batch_create:
+        log.warning("Airtable helpers not loaded; returning fetched without insert.")
+        return ScrapeResult(
+            runId=run_id,
+            requestedTarget=target,
+            providers=active,
+            mediaMode=mode,
+            insertedCount=0,
+            inserted=_summarize_for_response(fetched),
+        )
 
-    for row in collected:
-        # Expect providers to normalize "Source URL" (or "Source URL" exact key)
-        src = row.get("Source URL") or row.get("Source_URL") or row.get("Source") or ""
-        src = (src or "").strip()
+    for row in fetched:
+        src = normalize_url(row.get("Source URL", ""))
         if not src:
             continue
-
-        # memory de-dupe to avoid checking same URL multiple times
-        if src in seen:
-            continue
-        seen.add(src)
-
-        # Airtable de-dupe (skip if already present)
         try:
-            exists = await airtable_exists_by_source_url(src)
+            exists = airtable_exists_by_source_url(src)
         except Exception as e:
-            log.warning("Airtable exists check failed (%s). Skipping row.", e)
-            continue
+            log.warning("Airtable exists check failed for %s: %s", src, e)
+            exists = False
 
         if not exists:
-            # Normalize key to your exact Airtable column names
-            to_insert.append({
-                "Title": row.get("Title") or "",
-                "Provider": row.get("Provider") or "",
-                "Media Type": row.get("Media Type") or "",
-                "Source URL": src,
-                "Thumbnail": row.get("Thumbnail") or {},
-                "Published/Created": row.get("Published/Created") or "",
-                "Copyright": row.get("Copyright") or "",
-                # add any other mapped fields here if your base expects them
-                "Search Topics Used": topic,
-            })
+            to_insert.append(row)
 
-        # Stop once we have at least target rows queued
-        if len(to_insert) >= target:
-            break
-
-    # ------------------------------- Batch insert ------------------------------
-
-    inserted_records: List[Dict[str, Any]] = []
+    inserted_count = 0
     if to_insert:
         try:
-            inserted_records = await airtable_batch_create(to_insert)
+            inserted_count = airtable_batch_create(to_insert)
         except Exception as e:
-            log.warning("Airtable batch create failed: %s", e)
-            inserted_records = []
+            log.warning("Airtable batch insert failed: %s", e)
 
-    # Echo back a minimal view of inserted rows
-    light = []
-    for r in inserted_records:
-        light.append({
-            "Title": r.get("fields", {}).get("Title") or "",
-            "Provider": r.get("fields", {}).get("Provider") or "",
-            "Source_URL": r.get("fields", {}).get("Source URL") or "",
-        })
-
-    return ScrapeResponse(
+    return ScrapeResult(
         runId=run_id,
         requestedTarget=target,
-        providers=list(body.providers),
-        mediaMode=body.mediaMode,
-        insertedCount=len(inserted_records),
-        inserted=light,
+        providers=active,
+        mediaMode=mode,
+        insertedCount=inserted_count,
+        inserted=_summarize_for_response(to_insert[:inserted_count] or fetched[:1]),
     )
