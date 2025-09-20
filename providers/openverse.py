@@ -1,125 +1,188 @@
+# providers/openverse.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
-import asyncio
-from aiohttp import ClientSession, ClientError
-
-OPENVERSE_API = "https://api.openverse.org/v1/images"
+import httpx
 
 
-def _coalesce(*vals: Optional[str]) -> Optional[str]:
-    for v in vals:
-        if v:
-            return v
+OPENVERSE_API = os.getenv("OPENVERSE_API", "https://api.openverse.org/v1/images")
+REQUEST_TIMEOUT = float(os.getenv("OPENVERSE_TIMEOUT", "15"))  # seconds
+# Slightly over-request to improve chances of meeting target_count after filtering
+OVERSHOOT_FACTOR = float(os.getenv("OPENVERSE_OVERSHOOT", "2.0"))
+MAX_PAGE_SIZE = 100
+
+
+def _parse_year_range(search_dates: Optional[str]) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Accepts formats like:
+      "2000-2010", "1999–2005", "2008", "", None
+    Returns (start_year, end_year) where any may be None.
+    """
+    if not search_dates:
+        return (None, None)
+    cleaned = (
+        search_dates.replace("–", "-")
+        .replace("—", "-")
+        .replace(" ", "")
+        .strip()
+    )
+    if not cleaned:
+        return (None, None)
+
+    if "-" in cleaned:
+        a, b = cleaned.split("-", 1)
+        try:
+            start = int(a)
+        except ValueError:
+            start = None
+        try:
+            end = int(b)
+        except ValueError:
+            end = None
+        return (start, end)
+
+    # single year
+    try:
+        y = int(cleaned)
+        return (y, y)
+    except ValueError:
+        return (None, None)
+
+
+def _year_from_record(rec: Dict[str, Any]) -> Optional[int]:
+    """
+    Best-effort: Openverse image records don’t always include a capture/publication year.
+    Common fields: 'source', 'title', 'creator', 'thumbnail', 'url', 'license', 'license_version',
+    'provider', 'foreign_landing_url', 'id', etc. Some have 'taken_at' or 'created_on'.
+    """
+    for key in ("taken_at", "created_on", "created_at", "taken_on", "capture_date"):
+        val = rec.get(key)
+        if isinstance(val, str) and len(val) >= 4:
+            try:
+                return int(val[:4])
+            except ValueError:
+                pass
     return None
 
 
-def _license_string(item: Dict[str, Any]) -> str:
-    # Examples: "CC-BY 4.0", "CC0", "PDM"
-    lic = (item.get("license") or "").upper()
-    ver = item.get("license_version") or ""
-    return (f"{lic} {ver}").strip()
+def _license_string(rec: Dict[str, Any]) -> str:
+    lic = (rec.get("license") or "").upper()
+    ver = (rec.get("license_version") or "").strip()
+    if lic and ver:
+        return f"{lic} {ver}"
+    return lic or ""
 
 
-def _normalize_record(
-    item: Dict[str, Any],
-    topic: str,
-    search_dates: str,
-) -> Dict[str, Any]:
+def _normalize_item(rec: Dict[str, Any], topic: str, search_dates: Optional[str]) -> Dict[str, Any]:
     """
-    Return a dict shaped to be easy for your Airtable mapping layer.
-    (Your app's insert step can pick/rename only the fields it needs.)
+    Convert an Openverse record to your pipeline's normalized dict
+    (fields your Airtable mapping expects).
+    NOTE: app.py adds `Index` and `Run ID`.
     """
+    title = rec.get("title") or "Untitled"
+    thumb = rec.get("thumbnail") or rec.get("url")
+    source_url = rec.get("foreign_landing_url") or rec.get("url") or ""
+    created_display = rec.get("created_on") or rec.get("taken_at") or ""
+
     return {
-        # Core columns used later in your pipeline
-        "Title": _coalesce(item.get("title"), "Untitled"),
-        "Source URL": _coalesce(item.get("foreign_landing_url"), item.get("url")),
-        "Thumbnail": {
-            "id": item.get("id"),
-            "url": item.get("thumbnail"),
-            "filename": None,
-        },
-        "Copyright": _license_string(item),
         "Media Type": "Image",
-        "Provider": _coalesce(item.get("provider"), item.get("source"), "Openverse"),
-        # Sometimes Openverse doesn’t provide a reliable date; keep None if missing
-        "Published/Created": _coalesce(
-            item.get("created_on"),
-            item.get("upload_date"),
-            item.get("last_synced_with_source"),
-        ),
-        # Helpful passthroughs (your app can drop these if it already sets them)
+        "Provider": "Openverse",
+        "Title": title,
+        "Source URL": source_url,
+        "Thumbnail": {
+            "id": rec.get("id"),
+            "url": thumb,
+            "filename": "",  # You can populate later when you download files, if needed
+        },
+        "Copyright": _license_string(rec),
+        "Published/Created": created_display,
         "Search Topics Used": topic,
-        "Search Dates Used": search_dates,
-        # Raw (safe subset) in case you want to inspect later
-        "_ov_id": item.get("id"),
-        "_ov_url": item.get("url"),
-        "_ov_landing": item.get("foreign_landing_url"),
-        "_ov_provider": item.get("provider"),
-        "_ov_source": item.get("source"),
+        "Search Dates Used": search_dates or "",
+        # "Run ID" and "Index" are added upstream in app.py
     }
 
 
 async def fetch_openverse_async(
-    *,
     topic: str,
     target_count: int,
-    search_dates: str,
-    use_precision: bool,  # currently unused, kept for interface parity
-    session: ClientSession,
+    search_dates: Optional[str] = None,
+    use_precision: Optional[bool] = None,  # not used by Openverse; kept for API symmetry
 ) -> List[Dict[str, Any]]:
     """
-    Query Openverse for images matching `topic` and return up to `target_count`
-    normalized records.
-
-    This function is defensive: network failures or unexpected payloads
-    return an empty list rather than bubbling a 500 up to FastAPI.
+    Query Openverse Images API and return up to `target_count` normalized items.
+    This function **never raises** for network or API errors — it logs and returns [] instead.
     """
-    # Page size max is 50; we only fetch what we need once.
-    page_size = max(1, min(50, int(target_count or 1)))
+    # Avoid pathological values
+    if target_count <= 0:
+        return []
 
-    params: Dict[str, Any] = {
+    desired = max(1, target_count)
+    page_size = min(int(desired * OVERSHOOT_FACTOR), MAX_PAGE_SIZE)
+
+    # Build query params
+    params = {
         "q": topic,
         "page_size": page_size,
-        # Default to safe content; adjust if you add a setting later.
-        "mature": "false",
-        # Keep all license types; your Airtable has a Copyright column.
-        # You can filter to CC-only with: "license_type": "cc"
+        # You can add additional filters here if you want, e.g. 'mature': 'false'
     }
 
-    headers: Dict[str, str] = {
-        # If you later add an Openverse API key, include:
-        # "Authorization": f"Bearer {os.environ['OPENVERSE_API_KEY']}"
+    headers = {
+        # A desktop UA helps reduce some 403/blocked responses
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        )
     }
 
     try:
-        async with session.get(OPENVERSE_API, params=params, headers=headers, timeout=30) as resp:
-            if resp.status != 200:
-                # Log-lite shape for upstream logger (FastAPI will capture prints)
-                print(f"[openverse] HTTP {resp.status} for topic={topic!r} params={params}")
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers=headers) as client:
+            resp = await client.get(OPENVERSE_API, params=params)
+            # Gracefully handle rate-limit / forbidden
+            if resp.status_code in (401, 402, 403, 429):
+                print(
+                    f"[WARN] Openverse blocked or rate-limited "
+                    f"(status {resp.status_code}). Returning empty result."
+                )
                 return []
-            data = await resp.json()
+            if resp.status_code >= 500:
+                print(f"[WARN] Openverse server error {resp.status_code}. Returning empty result.")
+                return []
+            if resp.status_code != 200:
+                print(f"[WARN] Openverse unexpected status {resp.status_code}. Returning empty result.")
+                return []
 
-    except (ClientError, asyncio.TimeoutError) as e:
-        print(f"[openverse] request failed: {e}")
-        return []
+            data = resp.json()
     except Exception as e:
-        # JSON decode or other unexpected issues
-        print(f"[openverse] unexpected error: {e}")
+        print(f"[WARN] Openverse request failed: {e}")
         return []
 
     results = data.get("results") or []
-    out: List[Dict[str, Any]] = []
+    if not isinstance(results, list):
+        print("[WARN] Openverse payload missing 'results' list.")
+        return []
 
-    for item in results:
-        try:
-            out.append(_normalize_record(item, topic, search_dates))
-            if len(out) >= page_size:
-                break
-        except Exception as e:
-            # Skip single bad items; continue
-            print(f"[openverse] normalize error for id={item.get('id')}: {e}")
-            continue
+    start_year, end_year = _parse_year_range(search_dates)
 
-    return out
+    filtered: List[Dict[str, Any]] = []
+    for rec in results:
+        # Optional local year filter
+        if start_year or end_year:
+            y = _year_from_record(rec)
+            if y is None:
+                # If no year present, keep it — or drop it. Here we keep to avoid over-filtering.
+                pass
+            else:
+                if start_year and y < start_year:
+                    continue
+                if end_year and y > end_year:
+                    continue
+
+        filtered.append(_normalize_item(rec, topic=topic, search_dates=search_dates))
+
+        if len(filtered) >= desired:
+            break
+
+    return filtered[:desired]
