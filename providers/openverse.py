@@ -3,96 +3,119 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-from aiohttp import ClientResponse, ClientSession, ClientTimeout
+import httpx
 
-OPENVERSE_BASE = "https://api.openverse.engineering/v1/images/"
+# ---------- helpers ----------
 
-_year_pair = re.compile(r"(?P<y1>\d{4})\D+(?P<y2>\d{4})")
+YEAR_RANGE_RX = re.compile(r"^\s*(\d{4})\s*[-–]\s*(\d{4})\s*$")
 
-def _parse_year_range(search_dates: Optional[str]) -> Optional[tuple[int, int]]:
-    """
-    Accepts "2000-2010", "2000–2010", "2000 — 2010", etc.
-    Returns (2000, 2010) or None.
-    """
+def _parse_year_range(search_dates: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Accepts formats like '2000-2010' or '1995–2005'. Returns (start, end) or None."""
     if not search_dates:
         return None
-    m = _year_pair.search(search_dates)
+    m = YEAR_RANGE_RX.match(str(search_dates))
     if not m:
         return None
-    y1 = int(m.group("y1"))
-    y2 = int(m.group("y2"))
-    lo, hi = (y1, y2) if y1 <= y2 else (y2, y1)
-    return (lo, hi)
+    a, b = int(m.group(1)), int(m.group(2))
+    if a > b:
+        a, b = b, a
+    return a, b
 
-def _year_or_none(created_on: Optional[str]) -> Optional[int]:
-    """
-    Openverse image objects may include 'created_on' (ISO date). Extract year if present.
-    """
-    if not created_on:
-        return None
-    m = re.match(r"(\d{4})", created_on.strip())
-    return int(m.group(1)) if m else None
+def _first_nonempty(*vals: Optional[str]) -> Optional[str]:
+    for v in vals:
+        if v:
+            s = str(v).strip()
+            if s:
+                return s
+    return None
 
-def _normalize_item(raw: Dict[str, Any]) -> Dict[str, Any]:
+def _infer_year(item: Dict[str, Any]) -> Optional[int]:
     """
-    Map Openverse fields to our normalized schema expected upstream.
-    Falls back carefully when fields are absent.
+    Try very gently to find a year in typical Openverse fields.
+    We DO NOT fail if we can't find one.
     """
-    title = raw.get("title") or raw.get("foreign_landing_url") or "Untitled"
-    # In Openverse, 'foreign_landing_url' is the page where the media lives.
-    source_url = raw.get("foreign_landing_url") or raw.get("url") or ""
-    # Prefer thumbnail if provided, fall back to 'url'
-    thumb = raw.get("thumbnail") or raw.get("url") or ""
-    license_id = raw.get("license")  # e.g., 'cc-by', 'cc0', etc.
-    provider = raw.get("provider") or "Openverse"
-    created_on = raw.get("created_on") or raw.get("created_at")  # some datasets use created_at
+    # Some providers expose 'created_on', 'created', or 'source', or a date-like 'title'.
+    for key in ("created_on", "created", "date", "publish_date"):
+        v = item.get(key)
+        if isinstance(v, str) and re.search(r"\d{4}", v):
+            try:
+                # Try first 4-digit match
+                yr = int(re.search(r"(\d{4})", v).group(1))  # type: ignore[arg-type]
+                if 1800 <= yr <= datetime.utcnow().year + 1:
+                    return yr
+            except Exception:
+                pass
+
+    # Sometimes a year hides inside 'title' or 'description'
+    for key in ("title", "description"):
+        v = item.get(key)
+        if isinstance(v, str):
+            m = re.search(r"(\d{4})", v)
+            if m:
+                yr = int(m.group(1))
+                if 1800 <= yr <= datetime.utcnow().year + 1:
+                    return yr
+    return None
+
+def _in_year_range(item: Dict[str, Any], yr_range: Optional[Tuple[int, int]]) -> bool:
+    if yr_range is None:
+        return True
+    yr = _infer_year(item)
+    if yr is None:
+        # If user asked for a date range and we cannot infer a year, skip it quietly.
+        return False
+    return yr_range[0] <= yr <= yr_range[1]
+
+def _normalize_row(
+    item: Dict[str, Any],
+    topic: str,
+    search_dates: Optional[str],
+    run_id: str,
+) -> Dict[str, Any]:
+    """
+    Return a row compatible with the Airtable schema used elsewhere.
+    """
+    # Openverse fields vary; common ones:
+    #  - 'title', 'foreign_landing_url', 'url', 'thumbnail', 'provider'
+    #  - license fields: 'license', 'license_version', 'license_url'
+    title = _first_nonempty(item.get("title"), "Untitled")
+    landing = _first_nonempty(item.get("foreign_landing_url"), item.get("url"))
+    thumb = _first_nonempty(item.get("thumbnail"))
+    provider = _first_nonempty(item.get("provider"), "Openverse")
+
+    # Build a friendly copyright string when possible
+    lic = (item.get("license") or "") .upper()
+    lic_ver = item.get("license_version") or ""
+    lic_url = item.get("license_url") or ""
+    copyright_text = "Unknown"
+    if lic:
+        copyright_text = f"{lic} {lic_ver}".strip()
+        if lic_url:
+            copyright_text += f" ({lic_url})"
+
+    # Best-effort date
+    pub_year = _infer_year(item)
+    published = str(pub_year) if pub_year else ""
 
     return {
-        "title": title,
-        "source_url": source_url,
-        "thumbnail_url": thumb,
-        "copyright": license_id or "Unknown",
-        "provider": provider,
-        "published": created_on or "",
-        "media_type": "Image",
+        "Index": None,  # Autonumber in Airtable
+        "Media Type": "Image",
+        "Provider": provider,
+        "Thumbnail": [{"url": thumb}] if thumb else [],
+        "Title": title,
+        "Source URL": landing or "",
+        "Search Topics Used": topic,
+        "Search Dates Used": search_dates or "",
+        "Published/Created": published,
+        "Copyright": copyright_text,
+        "Run ID": run_id,
+        "Notes": "",
     }
 
-async def _fetch_page(
-    session: ClientSession,
-    logger,
-    q: str,
-    page: int,
-    page_size: int = 50,
-) -> Optional[Dict[str, Any]]:
-    """
-    Fetch a single page from Openverse images API.
-    Returns parsed JSON dict or None on error.
-    """
-    params = {
-        "q": q,
-        "page": page,
-        "page_size": page_size,
-    }
-
-    # 15s total timeout prevents Render log warning and long hangs
-    timeout = ClientTimeout(total=15)
-
-    try:
-        async with session.get(OPENVERSE_BASE, params=params, timeout=timeout) as resp:
-            if resp.status == 301 or resp.status == 302:
-                # Shouldn't happen for the API hostname, but handle gracefully.
-                logger.warning("Openverse unexpected redirect (%s). Returning empty page.", resp.status)
-                return None
-            if resp.status != 200:
-                text = await resp.text()
-                logger.warning("Openverse non-200 (%s): %s", resp.status, text[:400])
-                return None
-            return await resp.json()
-    except Exception as e:
-        logger.warning("Openverse page fetch failed: %s", e)
-        return None
+# ---------- main fetcher ----------
 
 async def fetch_openverse_async(
     *,
@@ -100,61 +123,80 @@ async def fetch_openverse_async(
     search_dates: Optional[str],
     target_count: int,
     run_id: str,
-    session: ClientSession,
-    logger,
+    use_precision: bool = False,   # accepted but currently unused; kept for compatibility
+    logger: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Primary provider entry point (signature matches app.py call sites).
+    Query Openverse Images API and return normalized rows.
 
-    Returns a list of normalized image dicts with at most `target_count` items.
-    Safe on errors: logs and returns [].
+    Must accept the exact keyword parameters the rest of your app sends:
+      topic, search_dates, target_count, run_id, (optional) use_precision, logger
     """
-    # Defensive guards
-    topic = (topic or "").strip()
-    if not topic:
-        logger.warning("Openverse: empty topic, run_id=%s", run_id)
-        return []
+    log = (logger.info if logger else lambda *a, **k: None)
+    warn = (logger.warning if logger else lambda *a, **k: None)
+
+    # Defensive bounds
+    page_size = max(1, min(int(target_count or 1), 20))
 
     yr_range = _parse_year_range(search_dates)
-    need = max(0, int(target_count) if isinstance(target_count, int) else 0)
-    if need == 0:
+
+    # API docs suggest: https://api.openverse.engineering/v1/images/?q=...&page_size=...
+    base_url = "https://api.openverse.engineering/v1/images/"
+    params = {
+        "q": topic,
+        "page_size": page_size,
+        # We avoid brittle filters; titles, descriptions, tags are searched by default.
+    }
+
+    headers = {
+        # Some CDNs show 403/blocked to generic bots; send a real UA.
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+
+    try:
+        async with httpx.AsyncClient(
+            headers=headers,
+            follow_redirects=True,
+            timeout=timeout,
+        ) as client:
+            resp = await client.get(base_url, params=params)
+            if resp.status_code != 200:
+                warn(
+                    "Openverse unexpected status %s. Returning empty result.",
+                    resp.status_code,
+                )
+                return []
+
+            data = resp.json()
+            results: List[Dict[str, Any]] = list(data.get("results") or [])
+
+            # Post-filter by year range if requested
+            filtered = [it for it in results if _in_year_range(it, yr_range)]
+
+            # Normalize & dedupe by Source URL
+            rows: List[Dict[str, Any]] = []
+            seen = set()
+            for it in filtered:
+                row = _normalize_row(it, topic=topic, search_dates=search_dates, run_id=run_id)
+                key = row.get("Source URL") or row.get("Title")
+                if key and key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+
+            # We only need up to target_count
+            final_rows = rows[:target_count]
+            log("Openverse returned %d items (after filtering)", len(final_rows))
+            return final_rows
+
+    except httpx.TimeoutException:
+        warn("Openverse timeout; returning empty result.")
         return []
-
-    results: List[Dict[str, Any]] = []
-
-    # We’ll pull a couple pages max to keep latency low on free Render
-    # (50 per page; adjust if you routinely need more than 100)
-    max_pages = 3
-    page = 1
-
-    while page <= max_pages and len(results) < need:
-        data = await _fetch_page(session, logger, q=topic, page=page, page_size=50)
-        page += 1
-        if not data:
-            continue
-
-        items = data.get("results") or []
-        if not isinstance(items, list) or not items:
-            continue
-
-        for raw in items:
-            # Year filter if the API provides a year-like field
-            if yr_range:
-                y = _year_or_none(raw.get("created_on") or raw.get("created_at"))
-                if y is not None:
-                    lo, hi = yr_range
-                    if y < lo or y > hi:
-                        continue  # outside requested window
-
-            norm = _normalize_item(raw)
-            # Discard obviously incomplete rows
-            if not norm["source_url"]:
-                continue
-
-            results.append(norm)
-            if len(results) >= need:
-                break
-
-    # Log what we’re returning (count only, to keep logs tidy)
-    logger.info("Openverse run_id=%s returning %d items", run_id, len(results))
-    return results
+    except Exception as e:
+        warn("Provider openverse failed: %s", e)
+        return []
