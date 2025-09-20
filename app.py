@@ -24,7 +24,7 @@ if not AIRTABLE_BASE_ID:
 
 SHORTCUTS_API_KEY = os.getenv("SHORTCUTS_API_KEY")
 
-app = FastAPI(title="Media Scrape Backend", version="1.2.0")
+app = FastAPI(title="Media Scrape Backend", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +40,7 @@ class ScrapeSpec(BaseModel):
     targetCount: int = Field(ge=1, le=100)
     providers: List[str] = Field(default_factory=list)
     runId: Optional[str] = None
+    mediaMode: str = "Both"   # "Videos" | "Images" | "Both"
 
 @app.middleware("http")
 async def require_key(request: Request, call_next):
@@ -72,13 +73,21 @@ def map_to_airtable_fields(item: Dict[str, Any], index: int, run_id: str, topic:
         fields["Thumbnail"] = [{"url": thumb}]
     return fields
 
-async def fetch_all(providers: List[str], topic: str, search_dates: str, wanted: int) -> List[Dict[str, Any]]:
+async def fetch_all(providers: List[str], topic: str, search_dates: str, wanted: int, media_mode: str = "Both") -> List[Dict[str, Any]]:
+    """Fetch in parallel from selected providers, optionally skipping mismatched media types for efficiency."""
     after, before = parse_search_dates(search_dates)
     arch_y1, arch_y2 = archive_year_bounds(search_dates)
+    media = (media_mode or "Both").strip().lower()
 
     tasks = []
     for p in providers:
         key = (p or "").strip().lower()
+        # Optional efficiency: skip providers that cannot produce the requested media type
+        if media == "videos" and key == "openverse":
+            continue  # images-only provider
+        if media == "images" and key == "youtube":
+            continue  # videos-only provider
+
         if key == "youtube":
             tasks.append(fetch_youtube_async(topic, max_results=max(50, wanted*2),
                                              published_after=after, published_before=before))
@@ -109,7 +118,14 @@ async def scrape_and_insert(spec: ScrapeSpec, x_shortcuts_key: str | None = Head
     run_id = spec.runId or str(uuid.uuid4())
     wanted = min(max(spec.targetCount, 1), 100)
 
-    candidates = await fetch_all(providers, topic, spec.searchDates, wanted)
+    # Fetch candidates
+    candidates = await fetch_all(providers, topic, spec.searchDates, wanted, media_mode=spec.mediaMode)
+
+    # Enforce mediaMode strictly (post-filter to be safe)
+    mode = (spec.mediaMode or "Both").strip().lower()
+    if mode in ("videos", "images"):
+        want = "Video" if mode == "videos" else "Image"
+        candidates = [c for c in candidates if (c.get("type") == want)]
 
     # Normalize & dedupe within batch
     seen = set()
@@ -140,13 +156,15 @@ async def scrape_and_insert(spec: ScrapeSpec, x_shortcuts_key: str | None = Head
     idx = 0
     for c in new_items[:wanted]:
         idx += 1
-        records_fields.append(map_to_airtable_fields(c, index=idx, run_id=run_id, topic=spec.topic, search_dates=spec.searchDates))
+        records_fields.append(map_to_airtable_fields(c, index=idx, run_id=run_id,
+                                                    topic=spec.topic, search_dates=spec.searchDates))
 
     inserted = await airtable_batch_create(records_fields)
     return {
         "runId": run_id,
         "requestedTarget": wanted,
         "providers": providers,
+        "mediaMode": spec.mediaMode,
         "insertedCount": len(inserted),
         "inserted": inserted
     }
