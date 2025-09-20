@@ -5,7 +5,6 @@ import httpx
 
 OPENVERSE_ENDPOINT = "https://api.openverse.engineering/v1/images/"
 
-# We only request the fields we actually use.
 DEFAULT_FIELDS = [
     "id",
     "title",
@@ -21,7 +20,6 @@ DEFAULT_FIELDS = [
 
 HEADERS = {
     "Accept": "application/json",
-    # A polite UA helps with some CDNs and rate-limiters.
     "User-Agent": "media-scrape-backend/1.0 (+https://media-scrape-backend.onrender.com)",
 }
 
@@ -29,7 +27,6 @@ HEADERS = {
 def _to_airtable_item(
     obj: Dict[str, Any], *, topic: str, run_id: str, search_dates: str
 ) -> Dict[str, Any]:
-    """Convert one Openverse item into your Airtable row 'fields' dict."""
     src_url = obj.get("foreign_landing_url") or obj.get("url")
     thumb_url = obj.get("thumbnail") or obj.get("url")
 
@@ -50,7 +47,7 @@ def _to_airtable_item(
         "Thumbnail": [{"url": thumb_url}] if thumb_url else [],
         "Search Topics Used": topic,
         "Search Dates Used": search_dates or "",
-        "Published/Created": None,  # Openverse public API doesn't include creation date
+        "Published/Created": None,
         "Copyright": copyright_val,
     }
 
@@ -64,14 +61,6 @@ async def fetch_openverse_async(
     run_id: str,
     timeout_seconds: float = 10.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch images from Openverse and return a list of Airtable-ready 'fields' dicts.
-
-    Note: the Openverse public API does not currently expose a creation-date filter.
-    We record the user's requested date range in 'Search Dates Used' but cannot filter
-    the results server-side by date.
-    """
-    # httpx >=0.28 requires a fully-specified Timeout or a single default.
     timeout = httpx.Timeout(
         timeout_seconds,
         connect=timeout_seconds,
@@ -80,7 +69,6 @@ async def fetch_openverse_async(
         pool=timeout_seconds,
     )
 
-    # Over-fetch a little to improve chances of non-duplicate rows, but stay ≤50 (API limit).
     page_size = min(max(target_count * 3, 5), 50)
 
     params = {
@@ -98,11 +86,9 @@ async def fetch_openverse_async(
             follow_redirects=True,
         )
     except Exception:
-        # The caller logs provider errors; we just return empty on hard failures.
         return []
 
     if resp.status_code != 200:
-        # Non-200 → let the caller log the provider warning and continue.
         return []
 
     data = resp.json()
