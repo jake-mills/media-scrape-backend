@@ -1,203 +1,123 @@
-# app.py
-import os
-import logging
-from typing import List, Optional
+# app.py (full)
 
-import aiohttp
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from starlette.responses import JSONResponse, Response
+import os
+from typing import List, Literal, Optional
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+import httpx
 
 from airtable_client import AirtableClient
-from providers.openverse import fetch_openverse_async
+from providers.openverse import OpenverseProvider
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("app")
+APP = FastAPI(title="media-scrape-backend")
 
-# ------------------------------------------------------------------------------
-# Environment
-# ------------------------------------------------------------------------------
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "")
-SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY")
-DEBUG_OPENVERSE = os.getenv("DEBUG_OPENVERSE")
-
-if not all([AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
-    log.warning("One or more Airtable environment variables are missing.")
-
+SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
 if not SHORTCUTS_KEY:
-    log.warning("SHORTCUTS_KEY is not set; all requests will be rejected (403).")
+    print("WARNING SHORTCUTS_KEY is not set; all requests will be rejected (403).")
 
-# Optional verbose logs from the Openverse provider
-if DEBUG_OPENVERSE:
-    logging.getLogger("providers.openverse").setLevel(logging.INFO)
+# ---------- Models ----------
+MediaMode = Literal["Images", "Videos"]
 
-# ------------------------------------------------------------------------------
-# FastAPI app & middleware
-# ------------------------------------------------------------------------------
-app = FastAPI(title="Media Scrape Backend")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],           # lock down if you prefer
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Shared resources
-app.state.http_session: Optional[aiohttp.ClientSession] = None
-app.state.airtable: Optional[AirtableClient] = None
-
-@app.on_event("startup")
-async def _startup():
-    # Single shared HTTP session for the process
-    app.state.http_session = aiohttp.ClientSession()
-
-    # Single shared Airtable client that reuses the shared session
-    app.state.airtable = AirtableClient(
-        base_id=AIRTABLE_BASE_ID,
-        table_name=AIRTABLE_TABLE_NAME,
-        api_key=AIRTABLE_API_KEY,
-        session=app.state.http_session,
-    )
-    log.info("Startup complete.")
-
-@app.on_event("shutdown")
-async def _shutdown():
-    if app.state.airtable:
-        await app.state.airtable.close()
-    if app.state.http_session and not app.state.http_session.closed:
-        await app.state.http_session.close()
-    log.info("Shutdown complete.")
-
-# ------------------------------------------------------------------------------
-# Models
-# ------------------------------------------------------------------------------
 class ScrapeRequest(BaseModel):
-    topic: str = Field(..., description="Topic/keywords to search.")
-    searchDates: Optional[str] = Field(
-        None,
-        description="Optional year range like '2000-2010' (provider will interpret best-effort).",
-    )
-    targetCount: int = Field(1, ge=1, le=50, description="Max records to insert.")
-    providers: List[str] = Field(..., description="e.g., ['Openverse'] or ['YouTube'].")
-    mediaMode: str = Field(..., description="'Images' or 'Videos'")
-    runId: str = Field(..., description="Caller-supplied id for traceability.")
+    topic: str
+    searchDates: Optional[str] = None
+    targetCount: int = 1
+    providers: List[str]
+    mediaMode: MediaMode
+    runId: Optional[str] = None
 
-# ------------------------------------------------------------------------------
-# Auth dependency (Apple Shortcuts)
-# ------------------------------------------------------------------------------
-async def require_shortcuts_key(x_shortcuts_key: Optional[str] = Header(None)):
-    if not SHORTCUTS_KEY:
-        # Service was started without a SHORTCUTS_KEY – reject everything
-        raise HTTPException(status_code=403, detail="Service not configured (SHORTCUTS_KEY).")
-    if x_shortcuts_key != SHORTCUTS_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden (invalid X-Shortcuts-Key).")
 
-# ------------------------------------------------------------------------------
-# Health + root (silence 404/405 noise after deploy)
-# ------------------------------------------------------------------------------
-@app.get("/health")
-async def health_get():
-    return {"ok": True}
+class InsertedRow(BaseModel):
+    Title: str
+    Provider: str
+    Source_URL: str
 
-@app.head("/health")
-async def health_head():
-    return Response(status_code=200)
 
-@app.get("/")
-async def root_ok():
-    return {"service": "media-scrape-backend", "ok": True}
+class ScrapeResponse(BaseModel):
+    runId: str
+    requestedTarget: int
+    providers: List[str]
+    mediaMode: MediaMode
+    insertedCount: int
+    inserted: List[InsertedRow]
 
-@app.head("/")
-async def root_head():
-    return Response(status_code=200)
 
-# ------------------------------------------------------------------------------
-# Main endpoint
-# ------------------------------------------------------------------------------
-@app.post("/scrape-and-insert")
+# ---------- Utils ----------
+async def keepalive():
+    # lightweight keepalive for Render (uses httpx, not aiohttp)
+    # HEAD /health so we don't hit FastAPI routing errors
+    url = "http://0.0.0.0:10000/health"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.head(url)
+    except Exception:
+        pass
+
+
+@APP.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+# ---------- Routes ----------
+@APP.post("/scrape-and-insert", response_model=ScrapeResponse)
 async def scrape_and_insert(
     payload: ScrapeRequest,
-    _: None = Depends(require_shortcuts_key),
+    x_shortcuts_key: str = Header(default="", alias="X-Shortcuts-Key"),
 ):
-    """
-    Orchestrates provider fetch -> de-dup -> insert into Airtable.
-    """
-    if app.state.http_session is None or app.state.airtable is None:
-        # Should not happen in normal operation, but guards against partial startup.
-        raise HTTPException(status_code=500, detail="Service not ready (startup incomplete).")
+    # auth gate
+    if not SHORTCUTS_KEY:
+        raise HTTPException(status_code=403, detail="Service not configured (SHORTCUTS_KEY).")
+    if x_shortcuts_key.strip() != SHORTCUTS_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden.")
 
-    run_id = payload.runId
-    topic = (payload.topic or "").strip()
-    providers = [p.strip() for p in payload.providers]
-    media_mode = (payload.mediaMode or "").strip()
-    target = int(payload.targetCount)
+    run_id = payload.runId or "swagger-test-openverse-OK"
+    mode = payload.mediaMode
 
-    if not topic:
-        raise HTTPException(status_code=422, detail="Topic cannot be empty.")
+    # We currently only wired Openverse; ignore others for now
+    provider_names = [p for p in payload.providers if p.lower() == "openverse"]
 
-    items: List[dict] = []
+    # fetch from providers
+    records: List[InsertedRow] = []
 
-    # --- Providers ---
-    for provider in providers:
-        try:
-            if provider.lower() == "openverse" and media_mode.lower() == "images":
-                fetched = await fetch_openverse_async(
-                    query=topic,
-                    search_dates=payload.searchDates,
-                    license_type="commercial",
-                    page_size=max(1, target),
-                    session=app.state.http_session,
-                    run_id=run_id,
+    if "openverse" in [p.lower() for p in provider_names] and mode == "Images":
+        items = await OpenverseProvider.fetch_openverse_async(
+            query=payload.topic,
+            license_type="commercial",
+            page_size=max(1, min(5, payload.targetCount)),
+            run_id=run_id,
+        )
+        # insert into Airtable with de-dup by Source_URL
+        client = AirtableClient()
+        for it in items[: payload.targetCount]:
+            created = await client.insert_if_new(
+                title=it["title"],
+                provider="Openverse",
+                source_url=it["source_url"],
+            )
+            if created:
+                records.append(
+                    InsertedRow(
+                        Title=it["title"] or "",
+                        Provider="Openverse",
+                        Source_URL=it["source_url"],
+                    )
                 )
-                items.extend(fetched)
 
-            # elif provider.lower() == "youtube" and media_mode.lower() == "videos":
-            #     fetched = await fetch_youtube_async(...)
-            #     items.extend(fetched)
-
-        except Exception as e:
-            # Do not fail the whole run because one provider hiccuped
-            log.warning("Provider %s failed: %s", provider, e)
-
-    # --- Deduplicate by Source_URL against Airtable and INSERT ---
-    inserted: List[dict] = []
-    for item in items:
-        source_url = item.get("source_url")
-        if not source_url:
-            continue
-
-        # IMPORTANT: this must be awaited (fixes 'was never awaited' + 0-insert behavior)
-        exists = await app.state.airtable.exists_by_source_url(source_url)
-        if exists:
-            continue
-
-        fields = {
-            "Title": (item.get("title") or topic).strip(),
-            "Provider": (item.get("provider") or "Openverse"),
-            "Source_URL": source_url,
-        }
-
-        await app.state.airtable.insert_record(fields)
-        inserted.append(fields)
-
-        if len(inserted) >= target:
-            break
-
-    return JSONResponse(
-        {
-            "runId": run_id,
-            "requestedTarget": target,
-            "providers": providers,
-            "mediaMode": media_mode,
-            "insertedCount": len(inserted),
-            "inserted": inserted,
-        }
+    # craft response
+    return ScrapeResponse(
+        runId=run_id,
+        requestedTarget=payload.targetCount,
+        providers=provider_names or payload.providers,
+        mediaMode=mode,
+        insertedCount=len(records),
+        inserted=records,
     )
+
+
+# ---------- Root handling to silence 405s ----------
+@APP.get("/")
+async def root_index():
+    # Prevent noisy GET / 405s in Render logs
+    return {"ok": True}
