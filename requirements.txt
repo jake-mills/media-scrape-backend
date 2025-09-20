@@ -12,5 +12,8 @@ python-dotenv==1.0.1
 # Data handling
 pydantic==2.8.2
 
-# (Optional, but strongly recommended for JSON debugging/logging)
+# Airtable integration
+airtable-python-wrapper==0.15.3
+
+# Optional, but strongly recommended for JSON debugging/logging
 orjson==3.10.7
