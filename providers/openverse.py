@@ -2,160 +2,173 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+import aiohttp
 
-log = logging.getLogger("provider.openverse")
 
-OPENVERSE_BASE = "https://api.openverse.org/v1/images/"
+OPENVERSE_SEARCH_URL = "https://api.openverse.engineering/v1/images/"
 
-# Helper: parse "2000–2010" or "2000-2010" into ("2000","2010")
-_YEAR_RANGE_RE = re.compile(r"^\s*(\d{4})\s*[-–]\s*(\d{4})\s*$")
+# Build a friendly UA. Some CDNs rate-limit empty/unknown UAs.
+UA = "media-scrape-backend/1.0 (+https://media-scrape-backend.onrender.com)"
 
-def _parse_year_range(search_dates: Optional[str]) -> Optional[str]:
+
+def _license_label(data: Dict[str, Any]) -> str:
     """
-    Convert a human string like '2000–2010' to Openverse 'created:2000..2010' filter.
-    Returns None if not a range.
+    Compose a human-readable copyright label from Openverse fields.
     """
-    if not search_dates:
-        return None
-    m = _YEAR_RANGE_RE.match(search_dates)
-    if not m:
-        return None
-    start, end = m.group(1), m.group(2)
-    return f"created:{start}..{end}"
+    lic = (data.get("license") or "").upper()
+    ver = (data.get("license_version") or "").strip()
+    if lic and ver:
+        return f"CC {lic}-{ver}"
+    if lic:
+        return f"CC {lic}"
+    return "Unknown"
 
-def _norm_item(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map a single Openverse image record to your Airtable row shape.
-    Only fields you actually use downstream are populated.
-    """
-    title = raw.get("title") or raw.get("id") or "Untitled"
-    source_url = raw.get("url") or raw.get("foreign_landing_url") or ""
-    thumbnail = raw.get("thumbnail") or raw.get("thumbnail_url") or raw.get("url") or ""
 
-    # Openverse dates are usually 'date_uploaded' or 'created_at'
-    published = raw.get("date_uploaded") or raw.get("created_at") or ""
+def _first_non_empty(*vals: Optional[str]) -> str:
+    for v in vals:
+        if v:
+            return v
+    return ""
 
-    license_ = raw.get("license") or ""
-    license_version = raw.get("license_version") or ""
-    copyright_str = (f"CC {license_.upper()} {license_version}".strip() if license_ else "").strip()
 
-    provider = "Openverse"  # stable label for your Provider column
-
+def _thumbnail_fields(data: Dict[str, Any]) -> Dict[str, str]:
+    thumb_url = data.get("thumbnail") or ""
+    # Try to derive a filename from the direct URL (if any)
+    filename = ""
+    try:
+        if thumb_url:
+            filename = thumb_url.rstrip("/").split("/")[-1].split("?")[0]
+    except Exception:
+        filename = ""
+    # An id is useful for dedupe/debug; use Openverse id
     return {
-        # Airtable target columns:
-        "Media Type": "Image",
-        "Provider": provider,
-        "Title": title,
-        "Source URL": source_url,
-        "Thumbnail": {
-            "id": raw.get("id") or "",
-            "url": thumbnail,
-            "filename": "",  # you can populate later if you actually download
-        },
-        "Published/Created": published,
-        "Copyright": copyright_str,
+        "id": str(data.get("id") or ""),
+        "url": thumb_url,
+        "filename": filename,
     }
+
 
 async def _fetch_page(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
+    query: str,
     *,
-    q: str,
-    filter_expr: Optional[str],
-    page: int,
-    page_size: int,
-) -> List[Dict[str, Any]]:
-    params: Dict[str, Any] = {
-        "q": q,
+    page: int = 1,
+    page_size: int = 20,
+    license_filter: Optional[str] = None,
+    timeout: aiohttp.ClientTimeout,
+) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    """
+    Fetch one page from Openverse. Returns (results, next_page).
+    next_page is None when there are no further pages.
+    """
+    params = {
+        "q": query,
         "page": page,
         "page_size": page_size,
-        # keep results useful/commons-usable by default; tweak if you want
-        "license_type": "commercial",   # optional; narrow to commercial-friendly
+        # Restrict to images only (this endpoint is already images).
+        # Add any additional filters you need here:
+        # "extension": "jpg,png",
     }
-    if filter_expr:
-        params["filter"] = filter_expr
+    if license_filter:
+        params["license"] = license_filter
 
-    resp = await client.get(OPENVERSE_BASE, params=params)
-    if resp.status_code != 200:
-        log.warning("Openverse unexpected status %s. Returning empty result.", resp.status_code)
-        return []
-    data = resp.json()
-    results = data.get("results") or []
-    return [ _norm_item(r) for r in results ]
+    async with session.get(
+        OPENVERSE_SEARCH_URL,
+        params=params,
+        timeout=timeout,
+        allow_redirects=True,
+    ) as resp:
+        # Openverse returns 200 with JSON body on success.
+        if resp.status != 200:
+            # Let caller decide; they can treat as transient and stop.
+            return [], None
+        data = await resp.json(loads=None, content_type=None)
+        results = data.get("results") or []
+        # Pagination hint
+        next_page = page + 1 if data.get("result_count") else None
+        # If results empty, stop
+        if not results:
+            next_page = None
+        return results, next_page
+
 
 async def fetch_openverse_async(
     *,
     topic: str,
-    search_dates: Optional[str] = None,
-    target_count: int = 1,
-    run_id: Optional[str] = None,
-    client: Optional[httpx.AsyncClient] = None,
-    **_ignore: Any,  # swallow any future/unknown kwargs (e.g., use_precision)
+    target_count: int,
+    run_id: str,
+    # Optional filters:
+    search_dates: Optional[str] = None,   # kept for signature parity; not used by Openverse directly
+    license_filter: Optional[str] = None,
+    page_size: int = 50,
+    request_timeout_sec: float = 12.0,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch images from Openverse for a query topic and optional year range.
-    Always keyword-only; safe defaults; never raises—returns [] on any upstream failure.
+    Query Openverse Images API for `topic` until we collect up to `target_count` items.
+    Returns a list of dicts already mapped to the Airtable field names your pipeline expects.
 
-    Parameters expected from app.py (names must match app’s call):
-      - topic: str
-      - search_dates: Optional[str]  # e.g., "2000–2010" or "2000-2010"
-      - target_count: int            # how many items you want (best-effort)
-      - run_id: Optional[str]        # forwarded for logging (optional)
-      - client: Optional[httpx.AsyncClient] # reuse if the app already has one
-      - **_ignore: Any               # tolerate extra kwargs without breaking
+    Notes:
+    - Openverse's public API does not support a direct "year range" filter for images,
+      so `search_dates` is not applied server-side. If you want a soft bias, you could
+      append the years to the query string, e.g., "wildlife 2000..2010". For now we keep
+      topic unchanged to avoid degrading results.
     """
-    if not topic:
-        return []
+    results: List[Dict[str, Any]] = []
+    if target_count <= 0:
+        return results
 
-    filter_expr = _parse_year_range(search_dates)
-    desired = max(1, int(target_count or 1))
-    page_size = min(50, max(1, desired))  # Openverse supports up to 500; 50 is a safe default
-    pages = (desired + page_size - 1) // page_size
+    timeout = aiohttp.ClientTimeout(
+        total=request_timeout_sec, connect=5, sock_connect=5, sock_read=request_timeout_sec
+    )
 
-    close_client = False
-    if client is None:
-        client = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=10.0, read=10.0, write=10.0),
-            follow_redirects=True,
-            headers={
-                "User-Agent": "MediaScrape/1.0 (+https://example.invalid)",  # be polite
-                "Accept": "application/json",
-            },
-        )
-        close_client = True
+    headers = {"User-Agent": UA, "Accept": "application/json"}
 
-    rows: List[Dict[str, Any]] = []
-    try:
-        tasks = [
-            _fetch_page(
-                client,
-                q=topic,
-                filter_expr=filter_expr,
-                page=i + 1,
-                page_size=page_size,
+    async with aiohttp.ClientSession(headers=headers) as session:
+        page = 1
+        while len(results) < target_count:
+            raw_items, next_page = await _fetch_page(
+                session,
+                query=topic,
+                page=page,
+                page_size=min(page_size, max(1, target_count * 2)),  # grab a few extra to filter
+                license_filter=license_filter,
+                timeout=timeout,
             )
-            for i in range(pages)
-        ]
-        for chunk in await asyncio.gather(*tasks, return_exceptions=True):
-            if isinstance(chunk, Exception):
-                log.warning("Openverse page fetch error: %s", chunk)
-                continue
-            rows.extend(chunk)
-            if len(rows) >= desired:
+
+            if not raw_items:
                 break
 
-        # trim to exactly target_count
-        if len(rows) > desired:
-            rows = rows[:desired]
+            # Map Openverse items → Airtable-friendly rows
+            for item in raw_items:
+                title = _first_non_empty(
+                    item.get("title"),
+                    item.get("creator"),
+                    # last resort: derive from URL
+                    (item.get("url") or "").rstrip("/").split("/")[-1].split("?")[0],
+                )
+                source_url = _first_non_empty(item.get("foreign_landing_url"), item.get("url"))
 
-        return rows
-    except Exception as e:
-        log.warning("Provider openverse failed: %s", e)
-        return []
-    finally:
-        if close_client:
-            await client.aclose()
+                mapped = {
+                    # **These keys match what your response preview & Airtable insert expect**
+                    "Title": title or "",
+                    "Provider": "Openverse",
+                    "Source URL": source_url or "",
+                    "Media Type": "Image",
+                    "Thumbnail": _thumbnail_fields(item),
+                    "Copyright": _license_label(item),
+                }
+
+                # Minimal dedupe on URL within this batch
+                already = any(r.get("Source URL") == mapped["Source URL"] for r in results)
+                if not already:
+                    results.append(mapped)
+                    if len(results) >= target_count:
+                        break
+
+            if not next_page:
+                break
+            page = next_page
+
+    return results
