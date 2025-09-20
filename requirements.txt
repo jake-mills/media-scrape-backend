@@ -2,18 +2,18 @@
 fastapi==0.115.0
 uvicorn==0.30.6
 
-# HTTP requests (async + sync)
+# Async HTTP client used by app.py and providers/openverse.py
+aiohttp==3.9.5
+
+# Optional/utility HTTP clients (keep if you like)
 httpx==0.27.2
 requests==2.32.3
 
-# Environment variable management
+# Env management (optional, fine to keep)
 python-dotenv==1.0.1
 
 # Data handling
 pydantic==2.8.2
 
-# (Optional, but strongly recommended for JSON debugging/logging)
+# Fast JSON (optional but nice)
 orjson==3.10.7
-
-# Airtable SDK (modern official community library)
-pyairtable
