@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: media-scrape-backend
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker -w 2 app:app
+    autoDeploy: true
+    plan: starter
+    envVars:
+      - key: AIRTABLE_API_KEY
+        sync: false
+      - key: AIRTABLE_BASE_ID
+        value: app7iv7XirA2VzppE
+      - key: AIRTABLE_TABLE_NAME
+        value: Videos & Images
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: SHORTCUTS_API_KEY
+        sync: false
+      - key: OPENVERSE_ENDPOINT
+        value: https://api.openverse.engineering/v1/images
+      - key: ARCHIVE_ROWS
+        value: "50"
