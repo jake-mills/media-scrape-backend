@@ -1,95 +1,89 @@
 # providers/openverse.py
-
-from __future__ import annotations
-
 import os
+import logging
 import aiohttp
+from aiohttp import ClientTimeout
 from typing import Any, Dict, List, Optional
 
-OPENVERSE_URL = "https://api.openverse.engineering/v1/images/"
-DEBUG = os.getenv("DEBUG_OPENVERSE", "0") == "1"
+log = logging.getLogger("providers.openverse")
 
-def _log(msg: str) -> None:
-    if DEBUG:
-        print(f"[Openverse] {msg}", flush=True)
 
-def _coerce_query(query: Optional[str], topic: Optional[str]) -> str:
-    # Accept either key; prefer explicit query if present.
-    q = (query or topic or "").strip()
-    return q
+OPENVERSE_IMAGES_ENDPOINT = "https://api.openverse.engineering/v1/images/"
+
+
+async def _ensure_session(session: aiohttp.ClientSession | None) -> tuple[aiohttp.ClientSession, bool]:
+    if session is None or session.closed:
+        return aiohttp.ClientSession(timeout=ClientTimeout(total=20)), True
+    return session, False
+
+
+def _pick_title(item: Dict[str, Any], fallback: str) -> str:
+    # Openverse can provide title, alt_text, or nothing
+    title = (item.get("title") or item.get("alt_text") or "").strip()
+    return title if title else fallback
+
+
+def _first_source_url(item: Dict[str, Any]) -> Optional[str]:
+    # Prefer the direct URL if available, else fall back to foreign_landing_url
+    url = item.get("url") or item.get("foreign_landing_url")
+    return url
+
 
 async def fetch_openverse_async(
     *,
-    # accept BOTH names so upstream callers can pass either
-    query: Optional[str] = None,
-    topic: Optional[str] = None,
-    search_dates: Optional[str] = None,   # not used by API, but accepted for interface parity
-    target_count: int = 1,
-    run_id: str = "",                     # optional for logs
+    query: str,
+    search_dates: Optional[str] = None,   # Not supported directly by the API; kept for consistency
+    license_type: str = "commercial",     # "commercial" filters to commercially-usable content
+    page_size: int = 10,
+    session: aiohttp.ClientSession | None = None,
+    run_id: Optional[str] = None,
+    use_precision: bool = False,          # reserved toggle; Openverse doesn't expose a precision flag
 ) -> List[Dict[str, Any]]:
     """
-    Fetch images from Openverse. Returns a list of normalized dicts
-    ready for Airtable insertion by the caller.
+    Query Openverse Images API and normalize to:
+      { "title": str, "provider": "Openverse", "source_url": str }
+
+    Returns a list with length <= page_size.
     """
-    q = _coerce_query(query, topic)
-    if not q:
-        _log("No query/topic provided; returning empty list.")
+    s, created = await _ensure_session(session)
+    try:
+        params: Dict[str, Any] = {
+            "q": query,
+            "license_type": license_type,  # keep default "commercial" so results are safer to reuse
+            "page_size": max(1, min(int(page_size), 20)),  # Openverse allows up to ~500; keep small by default
+        }
+
+        if os.getenv("DEBUG_OPENVERSE"):
+            log.info("[Openverse] run_id=%s q=%r params=%s", run_id, query, params)
+
+        async with s.get(OPENVERSE_IMAGES_ENDPOINT, params=params, allow_redirects=True) as resp:
+            if resp.status != 200:
+                log.warning("[Openverse] unexpected status %s", resp.status)
+                return []
+
+            data = await resp.json()
+
+        results = data.get("results") or []
+        normalized: List[Dict[str, Any]] = []
+        for item in results:
+            source_url = _first_source_url(item)
+            if not source_url:
+                continue
+
+            title = _pick_title(item, fallback=query)
+            normalized.append({
+                "title": title,
+                "provider": "Openverse",
+                "source_url": source_url,
+            })
+
+        if os.getenv("DEBUG_OPENVERSE"):
+            log.info("[Openverse] Returning %d item(s)", len(normalized))
+
+        return normalized[: max(1, int(page_size))]
+    except Exception as e:
+        log.warning("Provider openverse failed: %s", e)
         return []
-
-    # Build request params
-    page_size = max(1, min(20, int(target_count or 1)))
-    params = {
-        "q": q,
-        "license_type": "commercial",  # keeps results broadly usable
-        "page_size": page_size,
-    }
-
-    headers = {"User-Agent": "MediaScrape/1.0 (+render)"}
-    timeout = aiohttp.ClientTimeout(total=15, connect=5)
-
-    _log(f"run_id={run_id} q={q!r} params={params}")
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        try:
-            async with session.get(OPENVERSE_URL, params=params) as resp:
-                if resp.status != 200:
-                    _log(f"HTTP {resp.status} from Openverse")
-                    return []
-                data = await resp.json()
-        except Exception as e:
-            _log(f"Request error: {e!r}")
-            return []
-
-    results = data.get("results", []) if isinstance(data, dict) else []
-    items: List[Dict[str, Any]] = []
-
-    for idx, rec in enumerate(results, start=1):
-        # Normalize fields
-        title = (rec.get("title") or "").strip()
-        source_url = rec.get("url") or rec.get("foreign_landing_url") or ""
-        license_code = rec.get("license") or ""
-        created_on = rec.get("created_on") or ""
-        thumb = rec.get("thumbnail") or rec.get("url") or ""
-
-        items.append({
-            "Index": idx,
-            "Search Topics Used": q,
-            "Thumbnail": {
-                "id": rec.get("id") or "",
-                "url": thumb,
-                "filename": "",
-            },
-            "Title": title,
-            "Source URL": source_url,
-            "Copyright": license_code,
-            "Media Type": "Image",
-            "Provider": "Openverse",
-            "Published": created_on,
-            "Created": "",   # keep keys consistent with your table shape
-        })
-
-        if len(items) >= target_count:
-            break
-
-    _log(f"Returning {len(items)} item(s)")
-    return items
+    finally:
+        if created:
+            await s.close()
