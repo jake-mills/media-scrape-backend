@@ -1,81 +1,68 @@
 # airtable_client.py
-from __future__ import annotations
+"""
+Airtable client wrapper using pyairtable.
+Centralizes connection and common operations for the Media Scrape backend.
+"""
 
 import os
-from typing import Any, Dict, List, Optional
-
+from typing import Optional, Dict, Any, List
 from pyairtable import Table
-from pyairtable.formulas import match
 
-# Field name we use to detect duplicates
-SOURCE_URL_FIELD = "Source_URL"
+# Load environment variables
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME")
 
 
-class AirtableClient:
+def get_table() -> Table:
     """
-    Minimal Airtable client for this service.
-    - De-duplicate rows by Source_URL
-    - Batch insert new rows (Airtable bulk limit = 10)
+    Returns a configured Airtable Table instance.
+    Raises RuntimeError if required environment variables are missing.
     """
+    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
+        raise RuntimeError("Missing Airtable environment variables: "
+                           "AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME")
+    return Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_id: Optional[str] = None,
-        table_name: Optional[str] = None,
-    ) -> None:
-        api_key = api_key or os.environ["AIRTABLE_API_KEY"]
-        base_id = base_id or os.environ["AIRTABLE_BASE_ID"]
-        table_name = table_name or os.environ["AIRTABLE_TABLE_NAME"]
 
-        # pyairtable Table client
-        # Docs: https://pyairtable.readthedocs.io/en/stable/getting_started.html
-        self.table = Table(api_key, base_id, table_name)
+def insert_row(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Insert a single record into Airtable.
+    """
+    table = get_table()
+    return table.create(record)
 
-    # ---------- lookups ----------
 
-    def exists_by_source_url(self, source_url: str) -> bool:
-        """
-        Return True if a record with the given Source_URL already exists.
-        Uses first(formula=match({...})) per pyairtable docs.
-        """
-        if not source_url:
-            return False
-        rec = self.table.first(formula=match({SOURCE_URL_FIELD: source_url}))
-        return rec is not None
+def insert_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Insert multiple records into Airtable.
+    """
+    table = get_table()
+    return table.batch_create(records)
 
-    # ---------- inserts ----------
 
-    def insert_many(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Insert new items that do not already exist by Source_URL.
-        Each item can be either a plain dict of fields OR {"fields": {...}}.
-        Returns the list of created records (id + fields) from Airtable.
-        """
-        # Normalize to plain field dicts
-        normalized: List[Dict[str, Any]] = []
-        for item in items:
-            fields = item.get("fields", item)
-            # Keep only non-empty dicts
-            if isinstance(fields, dict) and fields:
-                normalized.append(fields)
+def find_by_source_url(url: str, field: str = "Source_URL") -> Optional[Dict[str, Any]]:
+    """
+    Find a record by its Source_URL (or another field if specified).
+    Returns the first match or None if no match found.
+    """
+    table = get_table()
+    formula = f"{{{field}}} = '{url}'"
+    matches = table.all(formula=formula, max_records=1)
+    return matches[0] if matches else None
 
-        # Filter out anything missing Source_URL or already present
-        to_create: List[Dict[str, Any]] = []
-        for fields in normalized:
-            src = fields.get(SOURCE_URL_FIELD) or fields.get(SOURCE_URL_FIELD.lower())
-            if not src:
-                continue
-            if not self.exists_by_source_url(str(src)):
-                to_create.append(fields)
 
-        if not to_create:
-            return []
+def update_row(record_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Update an existing record by ID.
+    """
+    table = get_table()
+    return table.update(record_id, fields)
 
-        # Airtable bulk create limit is 10 per request -> chunk
-        created: List[Dict[str, Any]] = []
-        for i in range(0, len(to_create), 10):
-            chunk = to_create[i : i + 10]
-            # Docs: table.batch_create([...])
-            created.extend(self.table.batch_create(chunk))
-        return created
+
+def delete_row(record_id: str) -> Dict[str, Any]:
+    """
+    Delete a record by ID.
+    """
+    table = get_table()
+    return table.delete(record_id)
