@@ -2,7 +2,7 @@ name: Keep Render Backend Warm
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/10 * * * *"   # every 10 minutes
   workflow_dispatch:        # allow manual run
 
 jobs:
@@ -17,4 +17,4 @@ jobs:
         run: |
           curl -fsS -m 20 -A "keepalive-gha" \
             https://media-scrape-backend.onrender.com/health \
-            || echo "Ping failed (cold start or transient) — will retry in 5m"
+            || echo "Ping failed (cold start or transient) — will retry in 10m"
