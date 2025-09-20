@@ -1,174 +1,102 @@
 # providers/openverse.py
-from __future__ import annotations
+import os
+import logging
+from typing import List, Dict, Any, Tuple
+import httpx
 
-import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+logger = logging.getLogger("uvicorn.error")
 
-import aiohttp
+# Enable extra logging if DEBUG_OPENVERSE=1 in environment
+DEBUG_OPENVERSE = os.getenv("DEBUG_OPENVERSE", "0") not in ("", "0", "false", "False")
 
+OPENVERSE_BASE = "https://api.openverse.engineering/v1/images/"
 
-OPENVERSE_SEARCH_URL = "https://api.openverse.engineering/v1/images/"
-
-# Build a friendly UA. Some CDNs rate-limit empty/unknown UAs.
-UA = "media-scrape-backend/1.0 (+https://media-scrape-backend.onrender.com)"
-
-
-def _license_label(data: Dict[str, Any]) -> str:
+def _to_airtable_row(item: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Compose a human-readable copyright label from Openverse fields.
+    Convert a single Openverse API result into Airtable row format.
     """
-    lic = (data.get("license") or "").upper()
-    ver = (data.get("license_version") or "").strip()
-    if lic and ver:
-        return f"CC {lic}-{ver}"
-    if lic:
-        return f"CC {lic}"
-    return "Unknown"
-
-
-def _first_non_empty(*vals: Optional[str]) -> str:
-    for v in vals:
-        if v:
-            return v
-    return ""
-
-
-def _thumbnail_fields(data: Dict[str, Any]) -> Dict[str, str]:
-    thumb_url = data.get("thumbnail") or ""
-    # Try to derive a filename from the direct URL (if any)
-    filename = ""
-    try:
-        if thumb_url:
-            filename = thumb_url.rstrip("/").split("/")[-1].split("?")[0]
-    except Exception:
-        filename = ""
-    # An id is useful for dedupe/debug; use Openverse id
     return {
-        "id": str(data.get("id") or ""),
-        "url": thumb_url,
-        "filename": filename,
+        "Title": item.get("title") or "",
+        "Provider": "Openverse",
+        "Source_URL": item.get("url") or "",
+        "Thumbnail": [{"url": item.get("thumbnail")}] if item.get("thumbnail") else [],
+        "Media Type": "Image",
+        "Copyright": (item.get("license") or "").upper(),
+        "Published": (item.get("created_on") or "")[:10],  # first 10 chars = YYYY-MM-DD
     }
 
-
-async def _fetch_page(
-    session: aiohttp.ClientSession,
-    query: str,
-    *,
-    page: int = 1,
-    page_size: int = 20,
-    license_filter: Optional[str] = None,
-    timeout: aiohttp.ClientTimeout,
-) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+def _build_params(query: str, start_year: int, end_year: int, limit: int) -> Dict[str, Any]:
     """
-    Fetch one page from Openverse. Returns (results, next_page).
-    next_page is None when there are no further pages.
+    Construct API parameters for Openverse search.
+    Openverse doesn’t support explicit year filters, so we bias with year text in query.
     """
-    params = {
-        "q": query,
-        "page": page,
-        "page_size": page_size,
-        # Restrict to images only (this endpoint is already images).
-        # Add any additional filters you need here:
-        # "extension": "jpg,png",
+    year_hint = f"{start_year}..{end_year}" if start_year and end_year else ""
+    q = f"{query} {year_hint}".strip()
+    return {
+        "q": q,
+        "license_type": "all",
+        "page_size": max(1, min(int(limit or 10), 50)),  # Openverse caps at 50
     }
-    if license_filter:
-        params["license"] = license_filter
-
-    async with session.get(
-        OPENVERSE_SEARCH_URL,
-        params=params,
-        timeout=timeout,
-        allow_redirects=True,
-    ) as resp:
-        # Openverse returns 200 with JSON body on success.
-        if resp.status != 200:
-            # Let caller decide; they can treat as transient and stop.
-            return [], None
-        data = await resp.json(loads=None, content_type=None)
-        results = data.get("results") or []
-        # Pagination hint
-        next_page = page + 1 if data.get("result_count") else None
-        # If results empty, stop
-        if not results:
-            next_page = None
-        return results, next_page
-
 
 async def fetch_openverse_async(
     *,
-    topic: str,
-    target_count: int,
-    run_id: str,
-    # Optional filters:
-    search_dates: Optional[str] = None,   # kept for signature parity; not used by Openverse directly
-    license_filter: Optional[str] = None,
-    page_size: int = 50,
-    request_timeout_sec: float = 12.0,
-) -> List[Dict[str, Any]]:
+    query: str,
+    start_year: int = None,
+    end_year: int = None,
+    limit: int = 10,
+    run_id: str = "manual-test",
+    **_  # absorb extra keyword args (prevents crashes on unexpected kwargs)
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Query Openverse Images API for `topic` until we collect up to `target_count` items.
-    Returns a list of dicts already mapped to the Airtable field names your pipeline expects.
-
-    Notes:
-    - Openverse's public API does not support a direct "year range" filter for images,
-      so `search_dates` is not applied server-side. If you want a soft bias, you could
-      append the years to the query string, e.g., "wildlife 2000..2010". For now we keep
-      topic unchanged to avoid degrading results.
+    Query Openverse API asynchronously and return results in Airtable-ready format.
+    Returns:
+      rows: List of dicts for Airtable insertion
+      meta: Diagnostic info (ok/count/params/errors/etc.)
     """
-    results: List[Dict[str, Any]] = []
-    if target_count <= 0:
-        return results
+    params = _build_params(query, start_year, end_year, limit)
+    headers = {"Accept": "application/json"}
+    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
 
-    timeout = aiohttp.ClientTimeout(
-        total=request_timeout_sec, connect=5, sock_connect=5, sock_read=request_timeout_sec
-    )
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        try:
+            resp = await client.get(OPENVERSE_BASE, params=params, headers=headers)
+        except Exception as e:
+            logger.warning("[OV %s] request failed: %r", run_id, e)
+            return [], {"ok": False, "error": str(e), "params": params}
 
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    status = resp.status_code
+    ctype = resp.headers.get("content-type", "")
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        page = 1
-        while len(results) < target_count:
-            raw_items, next_page = await _fetch_page(
-                session,
-                query=topic,
-                page=page,
-                page_size=min(page_size, max(1, target_count * 2)),  # grab a few extra to filter
-                license_filter=license_filter,
-                timeout=timeout,
-            )
+    if DEBUG_OPENVERSE:
+        logger.info(
+            "[OV %s] GET %s status=%s ctype=%s params=%s",
+            run_id, OPENVERSE_BASE, status, ctype.split(";")[0], params
+        )
 
-            if not raw_items:
-                break
+    if status != 200:
+        snippet = (resp.text or "")[:200].replace("\n", " ")
+        logger.warning("[OV %s] non-200 (%s). Body[200]=%s", run_id, status, snippet)
+        return [], {"ok": False, "status": status, "body_snippet": snippet, "params": params}
 
-            # Map Openverse items → Airtable-friendly rows
-            for item in raw_items:
-                title = _first_non_empty(
-                    item.get("title"),
-                    item.get("creator"),
-                    # last resort: derive from URL
-                    (item.get("url") or "").rstrip("/").split("/")[-1].split("?")[0],
-                )
-                source_url = _first_non_empty(item.get("foreign_landing_url"), item.get("url"))
+    try:
+        data = resp.json()
+    except Exception as e:
+        snippet = (resp.text or "")[:200].replace("\n", " ")
+        logger.warning("[OV %s] json decode failed: %r body[200]=%s", run_id, e, snippet)
+        return [], {"ok": False, "status": status, "body_snippet": snippet, "params": params}
 
-                mapped = {
-                    # **These keys match what your response preview & Airtable insert expect**
-                    "Title": title or "",
-                    "Provider": "Openverse",
-                    "Source URL": source_url or "",
-                    "Media Type": "Image",
-                    "Thumbnail": _thumbnail_fields(item),
-                    "Copyright": _license_label(item),
-                }
+    results = data.get("results") or []
+    if DEBUG_OPENVERSE:
+        preview = {}
+        if results:
+            first = results[0]
+            preview = {
+                "title": first.get("title"),
+                "url": first.get("url"),
+                "thumbnail": first.get("thumbnail"),
+                "license": first.get("license"),
+            }
+        logger.info("[OV %s] count=%d preview=%s", run_id, len(results), preview)
 
-                # Minimal dedupe on URL within this batch
-                already = any(r.get("Source URL") == mapped["Source URL"] for r in results)
-                if not already:
-                    results.append(mapped)
-                    if len(results) >= target_count:
-                        break
-
-            if not next_page:
-                break
-            page = next_page
-
-    return results
+    rows = [_to_airtable_row(it) for it in results[: params["page_size"]]]
+    return rows, {"ok": True, "count": len(rows), "params": params}
