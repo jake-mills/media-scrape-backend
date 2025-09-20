@@ -1,102 +1,95 @@
 # providers/openverse.py
+
+from __future__ import annotations
+
 import os
-import logging
-from typing import List, Dict, Any, Tuple
-import httpx
+import aiohttp
+from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger("uvicorn.error")
+OPENVERSE_URL = "https://api.openverse.engineering/v1/images/"
+DEBUG = os.getenv("DEBUG_OPENVERSE", "0") == "1"
 
-# Enable extra logging if DEBUG_OPENVERSE=1 in environment
-DEBUG_OPENVERSE = os.getenv("DEBUG_OPENVERSE", "0") not in ("", "0", "false", "False")
+def _log(msg: str) -> None:
+    if DEBUG:
+        print(f"[Openverse] {msg}", flush=True)
 
-OPENVERSE_BASE = "https://api.openverse.engineering/v1/images/"
-
-def _to_airtable_row(item: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a single Openverse API result into Airtable row format.
-    """
-    return {
-        "Title": item.get("title") or "",
-        "Provider": "Openverse",
-        "Source_URL": item.get("url") or "",
-        "Thumbnail": [{"url": item.get("thumbnail")}] if item.get("thumbnail") else [],
-        "Media Type": "Image",
-        "Copyright": (item.get("license") or "").upper(),
-        "Published": (item.get("created_on") or "")[:10],  # first 10 chars = YYYY-MM-DD
-    }
-
-def _build_params(query: str, start_year: int, end_year: int, limit: int) -> Dict[str, Any]:
-    """
-    Construct API parameters for Openverse search.
-    Openverse doesn’t support explicit year filters, so we bias with year text in query.
-    """
-    year_hint = f"{start_year}..{end_year}" if start_year and end_year else ""
-    q = f"{query} {year_hint}".strip()
-    return {
-        "q": q,
-        "license_type": "all",
-        "page_size": max(1, min(int(limit or 10), 50)),  # Openverse caps at 50
-    }
+def _coerce_query(query: Optional[str], topic: Optional[str]) -> str:
+    # Accept either key; prefer explicit query if present.
+    q = (query or topic or "").strip()
+    return q
 
 async def fetch_openverse_async(
     *,
-    query: str,
-    start_year: int = None,
-    end_year: int = None,
-    limit: int = 10,
-    run_id: str = "manual-test",
-    **_  # absorb extra keyword args (prevents crashes on unexpected kwargs)
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    # accept BOTH names so upstream callers can pass either
+    query: Optional[str] = None,
+    topic: Optional[str] = None,
+    search_dates: Optional[str] = None,   # not used by API, but accepted for interface parity
+    target_count: int = 1,
+    run_id: str = "",                     # optional for logs
+) -> List[Dict[str, Any]]:
     """
-    Query Openverse API asynchronously and return results in Airtable-ready format.
-    Returns:
-      rows: List of dicts for Airtable insertion
-      meta: Diagnostic info (ok/count/params/errors/etc.)
+    Fetch images from Openverse. Returns a list of normalized dicts
+    ready for Airtable insertion by the caller.
     """
-    params = _build_params(query, start_year, end_year, limit)
-    headers = {"Accept": "application/json"}
-    timeout = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+    q = _coerce_query(query, topic)
+    if not q:
+        _log("No query/topic provided; returning empty list.")
+        return []
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    # Build request params
+    page_size = max(1, min(20, int(target_count or 1)))
+    params = {
+        "q": q,
+        "license_type": "commercial",  # keeps results broadly usable
+        "page_size": page_size,
+    }
+
+    headers = {"User-Agent": "MediaScrape/1.0 (+render)"}
+    timeout = aiohttp.ClientTimeout(total=15, connect=5)
+
+    _log(f"run_id={run_id} q={q!r} params={params}")
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         try:
-            resp = await client.get(OPENVERSE_BASE, params=params, headers=headers)
+            async with session.get(OPENVERSE_URL, params=params) as resp:
+                if resp.status != 200:
+                    _log(f"HTTP {resp.status} from Openverse")
+                    return []
+                data = await resp.json()
         except Exception as e:
-            logger.warning("[OV %s] request failed: %r", run_id, e)
-            return [], {"ok": False, "error": str(e), "params": params}
+            _log(f"Request error: {e!r}")
+            return []
 
-    status = resp.status_code
-    ctype = resp.headers.get("content-type", "")
+    results = data.get("results", []) if isinstance(data, dict) else []
+    items: List[Dict[str, Any]] = []
 
-    if DEBUG_OPENVERSE:
-        logger.info(
-            "[OV %s] GET %s status=%s ctype=%s params=%s",
-            run_id, OPENVERSE_BASE, status, ctype.split(";")[0], params
-        )
+    for idx, rec in enumerate(results, start=1):
+        # Normalize fields
+        title = (rec.get("title") or "").strip()
+        source_url = rec.get("url") or rec.get("foreign_landing_url") or ""
+        license_code = rec.get("license") or ""
+        created_on = rec.get("created_on") or ""
+        thumb = rec.get("thumbnail") or rec.get("url") or ""
 
-    if status != 200:
-        snippet = (resp.text or "")[:200].replace("\n", " ")
-        logger.warning("[OV %s] non-200 (%s). Body[200]=%s", run_id, status, snippet)
-        return [], {"ok": False, "status": status, "body_snippet": snippet, "params": params}
+        items.append({
+            "Index": idx,
+            "Search Topics Used": q,
+            "Thumbnail": {
+                "id": rec.get("id") or "",
+                "url": thumb,
+                "filename": "",
+            },
+            "Title": title,
+            "Source URL": source_url,
+            "Copyright": license_code,
+            "Media Type": "Image",
+            "Provider": "Openverse",
+            "Published": created_on,
+            "Created": "",   # keep keys consistent with your table shape
+        })
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        snippet = (resp.text or "")[:200].replace("\n", " ")
-        logger.warning("[OV %s] json decode failed: %r body[200]=%s", run_id, e, snippet)
-        return [], {"ok": False, "status": status, "body_snippet": snippet, "params": params}
+        if len(items) >= target_count:
+            break
 
-    results = data.get("results") or []
-    if DEBUG_OPENVERSE:
-        preview = {}
-        if results:
-            first = results[0]
-            preview = {
-                "title": first.get("title"),
-                "url": first.get("url"),
-                "thumbnail": first.get("thumbnail"),
-                "license": first.get("license"),
-            }
-        logger.info("[OV %s] count=%d preview=%s", run_id, len(results), preview)
-
-    rows = [_to_airtable_row(it) for it in results[: params["page_size"]]]
-    return rows, {"ok": True, "count": len(rows), "params": params}
+    _log(f"Returning {len(items)} item(s)")
+    return items
