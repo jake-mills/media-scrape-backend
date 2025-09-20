@@ -1,103 +1,53 @@
-# app.py
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import Response
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, Request, Response, Header, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
-import asyncio
 
-# Import your providers
-from providers.openverse import fetch_openverse_async
-# from providers.youtube import fetch_youtube_async
-# from providers.archive import fetch_archive_async
-# ...add others here...
+# Import your existing routers / logic
+from routers import scrape  # adjust if your scrape routes live elsewhere
 
-app = FastAPI()
+app = FastAPI(
+    title="Media Scrape Backend",
+    description="Backend service for scraping videos/images and inserting into Airtable",
+    version="1.0.0"
+)
 
-# ---- Health Endpoints ----
+# Allow CORS for local development & Shortcuts
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# === Healthcheck routes ===
 @app.get("/health")
 async def health_get():
     return {"ok": True}
 
 @app.head("/health")
 async def health_head():
-    # Return empty body but 200 so HEAD pings are happy
     return Response(status_code=200)
 
-# ---- Config ----
-SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
+# === Root route (fix the 404 after deploy) ===
+@app.get("/", include_in_schema=False)
+async def root():
+    # Option A: redirect to Swagger UI
+    return RedirectResponse(url="/docs")
 
-# ---- Request/Response Models ----
-class ScrapeRequest(BaseModel):
-    topic: str
-    searchDates: Optional[str] = None
-    targetCount: int = 1
-    providers: List[str]
-    mediaMode: str
-    runId: Optional[str] = None
+    # Option B: simple JSON response instead of redirect
+    # return JSONResponse({"ok": True, "hint": "See /docs for API, /health for status"})
 
-class ScrapeResponse(BaseModel):
-    runId: str
-    requestedTarget: int
-    providers: List[str]
-    mediaMode: str
-    insertedCount: int
-    inserted: List[Dict[str, Any]]
+# === Include your scrape routes ===
+app.include_router(scrape.router)
 
-# ---- Main Route ----
-@app.post("/scrape-and-insert", response_model=ScrapeResponse)
-async def scrape_and_insert(
-    payload: ScrapeRequest,
-    x_shortcuts_key: str = Header(..., alias="X-Shortcuts-Key")
-):
-    # --- Key Check ---
-    if SHORTCUTS_KEY and x_shortcuts_key != SHORTCUTS_KEY:
-        raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key")
-
-    run_id = payload.runId or "manual-run"
-    inserted_items: List[Dict[str, Any]] = []
-
-    # Loop over providers
-    for provider in payload.providers:
-        provider = provider.lower()
-        items: List[Dict[str, Any]] = []
-
-        try:
-            if provider == "openverse":
-                items = await fetch_openverse_async(
-                    topic=payload.topic,
-                    target_count=payload.targetCount,
-                    search_dates=payload.searchDates,
-                    use_precision=None,
-                )
-
-            # elif provider == "youtube":
-            #     items = await fetch_youtube_async(...)
-            #
-            # elif provider == "archive":
-            #     items = await fetch_archive_async(...)
-            #
-            # ... add more providers here ...
-
-        except Exception as e:
-            # Safety tweak: log the provider failure, but continue gracefully
-            print(f"[WARN] Provider {provider} failed: {e}")
-            items = []
-
-        # Append normalized items
-        if items:
-            for idx, item in enumerate(items, start=1):
-                # Add Run ID and index for Airtable traceability
-                item["Run ID"] = run_id
-                item["Index"] = idx
-                inserted_items.append(item)
-
-    response = ScrapeResponse(
-        runId=run_id,
-        requestedTarget=payload.targetCount,
-        providers=payload.providers,
-        mediaMode=payload.mediaMode,
-        insertedCount=len(inserted_items),
-        inserted=inserted_items,
-    )
-    return response
+# === Security check middleware for Shortcuts Key ===
+@app.middleware("http")
+async def verify_shortcuts_key(request: Request, call_next):
+    # Skip health + docs so they always load
+    if request.url.path not in ["/health", "/", "/docs", "/openapi.json"]:
+        expected_key = os.getenv("SHORTCUTS_KEY")
+        provided_key = request.headers.get("X-Shortcuts-Key")
+        if expected_key and provided_key != expected_key:
+            raise HTTPException(status_code=403, detail="Forbidden: invalid X-Shortcuts-Key")
+    return await call_next(request)
