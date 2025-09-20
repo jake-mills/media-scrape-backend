@@ -1,89 +1,49 @@
-# providers/openverse.py
-import os
+from __future__ import annotations
+
+import httpx
 import logging
-import aiohttp
-from aiohttp import ClientTimeout
-from typing import Any, Dict, List, Optional
+from typing import Literal
 
-log = logging.getLogger("providers.openverse")
+log = logging.getLogger("openverse")
 
 
-OPENVERSE_IMAGES_ENDPOINT = "https://api.openverse.engineering/v1/images/"
-
-
-async def _ensure_session(session: aiohttp.ClientSession | None) -> tuple[aiohttp.ClientSession, bool]:
-    if session is None or session.closed:
-        return aiohttp.ClientSession(timeout=ClientTimeout(total=20)), True
-    return session, False
-
-
-def _pick_title(item: Dict[str, Any], fallback: str) -> str:
-    # Openverse can provide title, alt_text, or nothing
-    title = (item.get("title") or item.get("alt_text") or "").strip()
-    return title if title else fallback
-
-
-def _first_source_url(item: Dict[str, Any]) -> Optional[str]:
-    # Prefer the direct URL if available, else fall back to foreign_landing_url
-    url = item.get("url") or item.get("foreign_landing_url")
-    return url
+def _endpoint_for_media(media: Literal["image", "video"]) -> str:
+    return "images" if media == "image" else "videos"
 
 
 async def fetch_openverse_async(
     *,
     query: str,
-    search_dates: Optional[str] = None,   # Not supported directly by the API; kept for consistency
-    license_type: str = "commercial",     # "commercial" filters to commercially-usable content
-    page_size: int = 10,
-    session: aiohttp.ClientSession | None = None,
-    run_id: Optional[str] = None,
-    use_precision: bool = False,          # reserved toggle; Openverse doesn't expose a precision flag
-) -> List[Dict[str, Any]]:
+    media: Literal["image", "video"] = "image",
+    license_type: str = "commercial",
+    page_size: int = 1,
+    debug: bool = False,
+) -> list[dict]:
     """
-    Query Openverse Images API and normalize to:
-      { "title": str, "provider": "Openverse", "source_url": str }
-
-    Returns a list with length <= page_size.
+    Calls Openverse and returns a list of {title, source_url, provider} dicts.
     """
-    s, created = await _ensure_session(session)
-    try:
-        params: Dict[str, Any] = {
-            "q": query,
-            "license_type": license_type,  # keep default "commercial" so results are safer to reuse
-            "page_size": max(1, min(int(page_size), 20)),  # Openverse allows up to ~500; keep small by default
-        }
+    endpoint = _endpoint_for_media(media)
+    url = f"https://api.openverse.engineering/v1/{endpoint}/"
+    params = {"q": query, "license_type": license_type, "page_size": page_size}
+    headers = {"User-Agent": "media-scrape-backend/1.0"}
 
-        if os.getenv("DEBUG_OPENVERSE"):
-            log.info("[Openverse] run_id=%s q=%r params=%s", run_id, query, params)
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        r = await client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        data = r.json()
 
-        async with s.get(OPENVERSE_IMAGES_ENDPOINT, params=params, allow_redirects=True) as resp:
-            if resp.status != 200:
-                log.warning("[Openverse] unexpected status %s", resp.status)
-                return []
+    results = data.get("results", [])
+    if debug:
+        log.info("[Openverse] Returning %s item(s)", len(results))
 
-            data = await resp.json()
-
-        results = data.get("results") or []
-        normalized: List[Dict[str, Any]] = []
-        for item in results:
-            source_url = _first_source_url(item)
-            if not source_url:
-                continue
-
-            title = _pick_title(item, fallback=query)
-            normalized.append({
-                "title": title,
-                "provider": "Openverse",
-                "source_url": source_url,
-            })
-
-        if os.getenv("DEBUG_OPENVERSE"):
-            log.info("[Openverse] Returning %d item(s)", len(normalized))
-
-        return normalized[: max(1, int(page_size))]
-    except Exception as e:
-        log.warning("Provider openverse failed: %s", e)
-        return []
-    finally:
-        if created:
-            await s.close()
+    items: list[dict] = []
+    for row in results:
+        title = row.get("title") or query
+        # Prefer the direct asset URL; fall back to landing page if needed
+        src = row.get("url") or row.get("foreign_landing_url")
+        if not src:
+            continue
+        items.append(
+            {"title": title, "provider": "Openverse", "source_url": src}
+        )
+    return items
