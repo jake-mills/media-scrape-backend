@@ -1,8 +1,15 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-httpx==0.27.2
-requests==2.32.3
-python-dotenv==1.0.1
-orjson==3.10.7
-pydantic==2.10.3
-gunicorn==21.2.0
+# --- Web framework (Pydantic v2 line) ---
+fastapi==0.115.0          # Pydantic v2-based FastAPI
+pydantic==2.10.3          # Works on Python 3.13; FastAPI 0.115.* expects v2
+
+# --- ASGI server + worker ---
+uvicorn[standard]==0.30.6 # ASGI server (websockets, uvloop, httptools bundled via [standard])
+gunicorn==22.0.0          # Process manager (your start command uses gunicorn)
+
+# --- HTTP clients used by your code ---
+httpx==0.27.2             # async client (Openverse provider)
+requests==2.32.3          # sync client (Airtable REST helper)
+
+# --- Utilities ---
+python-dotenv==1.0.1      # optional .env support (if you ever use it locally)
+orjson==3.10.7            # fast JSON (FastAPI can leverage it if present)
