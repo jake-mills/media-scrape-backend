@@ -1,48 +1,40 @@
 import os
-from typing import Optional, Dict, Any
-from pyairtable import Table
+import requests
+import urllib.parse
 
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Media")
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Videos & Images")
 
-# Fail fast if the three required env vars aren’t present.
-if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
-    missing = [k for k, v in {
-        "AIRTABLE_API_KEY": AIRTABLE_API_KEY,
-        "AIRTABLE_BASE_ID": AIRTABLE_BASE_ID,
-        "AIRTABLE_TABLE_NAME": AIRTABLE_TABLE_NAME,
-    }.items() if not v]
-    raise RuntimeError(f"Missing Airtable env vars: {', '.join(missing)}")
+# ✅ Ensure table name is URL-encoded (spaces, &, etc.)
+ENCODED_TABLE_NAME = urllib.parse.quote(AIRTABLE_TABLE_NAME)
 
-_table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
+AIRTABLE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{ENCODED_TABLE_NAME}"
 
-
-def _escape_for_formula(value: str) -> str:
-    """
-    Airtable formulas use single-quoted strings; single quotes must be escaped as \'
-    """
-    return value.replace("'", r"\'")
+HEADERS = {
+    "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+    "Content-Type": "application/json"
+}
 
 
-def find_by_source_url(source_url: str) -> Optional[Dict[str, Any]]:
-    """
-    Return the first record whose {Source_URL} exactly matches source_url, or None.
-    """
-    # Build a safe formula without nested f-string gymnastics.
-    safe = _escape_for_formula(source_url)
-    formula = "{Source_URL} = '" + safe + "'"
-
-    # select() is limited to 1 record for speed.
-    records = _table.iterate(formula=formula, page_size=1, max_records=1)
-    for page in records:
-        for rec in page:
-            return rec  # first match
-    return None
+def insert_row(record: dict):
+    """Insert a new row into Airtable."""
+    response = requests.post(
+        AIRTABLE_URL,
+        headers=HEADERS,
+        json={"fields": record}
+    )
+    response.raise_for_status()
+    return response.json()
 
 
-def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create a record with the given fields; returns the Airtable record dict.
-    """
-    return _table.create(fields)
+def find_by_source_url(url: str):
+    """Find rows in Airtable by source_url field."""
+    formula = f"{{source_url}}='{url}'"
+    response = requests.get(
+        AIRTABLE_URL,
+        headers=HEADERS,
+        params={"filterByFormula": formula}
+    )
+    response.raise_for_status()
+    return response.json().get("records", [])
