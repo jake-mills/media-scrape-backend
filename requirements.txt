@@ -9,3 +9,7 @@ requests==2.32.3
 # Env + perf JSON
 python-dotenv==1.0.1
 orjson==3.10.7
+
+# Airtable + Pydantic v1 pin (required by pyairtable)
+pyairtable==2.3.3
+pydantic==1.10.15
