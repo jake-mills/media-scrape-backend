@@ -17,15 +17,14 @@ from providers.openverse import fetch_openverse  # rich fields for Images/Videos
 # -------------------------------------------------------------------
 # Config / Security
 # -------------------------------------------------------------------
-SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
+# Accept either SHORTCUTS_KEY or SHORTCUTS_API_KEY (Render YAML used the latter)
+SHORTCUTS_KEY = (os.getenv("SHORTCUTS_KEY") or os.getenv("SHORTCUTS_API_KEY") or "").strip()
 
-# -------------------------------------------------------------------
-# FastAPI app
-# -------------------------------------------------------------------
 app = FastAPI(title="Media Scrape Backend", version="1.0.0")
 
+
 # -------------------------------------------------------------------
-# Models (Pydantic v2)
+# Models (Pydantic v2-compatible)
 # -------------------------------------------------------------------
 MediaMode = Literal["Images", "Videos", "Both"]
 
@@ -37,21 +36,6 @@ class ScrapeRequest(BaseModel):
     mediaMode: MediaMode = Field(..., description="'Images', 'Videos', or 'Both'")
     runId: Optional[str] = Field(None, description="Client-supplied run id, echoed to Airtable 'Run ID'.")
 
-class InsertedRow(BaseModel):
-    # Mirrors Airtable fields for the 'Videos & Images' table
-    Index: Optional[int] = None  # Autonumber (not sent to Airtable)
-    Media_Type: str
-    Provider: str
-    Thumbnail: str
-    Title: str
-    Source_URL: str
-    Search_Topics_Used: str
-    Search_Dates_Used: str
-    Published_Created: str
-    Copyright: str
-    Run_ID: str
-    Notes: str
-
 class ScrapeResponse(BaseModel):
     runId: str
     requestedTarget: int
@@ -59,7 +43,7 @@ class ScrapeResponse(BaseModel):
     mediaMode: MediaMode
     insertedCount: int
     skippedCount: int
-    inserted: List[Dict[str, Any]]  # echo of Airtable field dicts
+    inserted: List[Dict[str, Any]]
 
 
 # -------------------------------------------------------------------
@@ -67,7 +51,7 @@ class ScrapeResponse(BaseModel):
 # -------------------------------------------------------------------
 @app.get("/health")
 async def health_get():
-    return {"ok": True}
+    return {"status": "ok"}
 
 @app.head("/health")
 async def health_head():
@@ -103,48 +87,41 @@ async def scrape_and_insert(
     want_images = req.mediaMode in ("Images", "Both")
     want_videos = req.mediaMode in ("Videos", "Both")
 
-    # ---- Currently support Openverse
-    providers = [p for p in req.providers if p.lower() == "openverse"]
-    if not providers:
-        return ScrapeResponse(
-            runId=run_id,
-            requestedTarget=requested_target,
-            providers=req.providers,
-            mediaMode=req.mediaMode,
-            insertedCount=0,
-            skippedCount=0,
-            inserted=[],
-        )
-
-    # ---- Fetch from Openverse (Images and/or Videos)
+    # ---- Supported providers
+    active_providers = []
     candidates: List[Dict[str, Any]] = []
-    if want_images:
-        candidates += await fetch_openverse(
-            topic=req.topic,
-            license_type="commercial",
-            page_size=max(1, requested_target * 3),
-            media="image",
-        )
-    if want_videos:
-        candidates += await fetch_openverse(
-            topic=req.topic,
-            license_type="commercial",
-            page_size=max(1, requested_target * 3),
-            media="video",
-        )
 
-    # ---- Deduplicate by Airtable "Source URL" and insert
+    for p in req.providers:
+        pl = p.lower().strip()
+        if pl == "openverse":
+            active_providers.append("Openverse")
+            if want_images:
+                candidates += await fetch_openverse(
+                    topic=req.topic,
+                    license_type="commercial",
+                    page_size=max(1, requested_target * 3),
+                    media="image",
+                )
+            if want_videos:
+                candidates += await fetch_openverse(
+                    topic=req.topic,
+                    license_type="commercial",
+                    page_size=max(1, requested_target * 3),
+                    media="video",
+                )
+        # (future: add elif pl == "youtube": ...)
+
     inserted_rows: List[Dict[str, Any]] = []
     skipped = 0
 
     for item in candidates:
-        # Build the Airtable record using EXACT field names from your table schema
+        # Build Airtable record using your exact column names
         fields: Dict[str, Any] = {
             "Media Type": item.get("Media Type", "Images" if want_images and not want_videos else "Videos"),
             "Provider": item.get("Provider", "Openverse"),
             "Thumbnail": item.get("Thumbnail", ""),
             "Title": item.get("Title") or req.topic,
-            "Source URL": item.get("Source URL") or item.get("Source_URL") or item.get("source_url") or "",
+            "Source URL": item.get("Source URL") or item.get("source_url") or "",
             "Search Topics Used": req.topic,
             "Search Dates Used": req.searchDates or "",
             "Published/Created": item.get("Published/Created") or item.get("Published") or item.get("created_on") or "",
@@ -153,16 +130,14 @@ async def scrape_and_insert(
             "Notes": item.get("Notes", ""),
         }
 
-        # Must have a URL to dedupe/insert
         if not fields["Source URL"]:
             continue
 
-        # De-dup check: field name EXACTLY "Source URL"
-        if find_by_source_url(fields["Source URL"], field="Source URL"):
+        # De-dup: exact match on "Source URL"
+        if find_by_source_url(fields["Source URL"]):
             skipped += 1
             continue
 
-        # Insert into Airtable
         insert_row(fields)
         inserted_rows.append(fields)
         if len(inserted_rows) >= requested_target:
@@ -172,7 +147,7 @@ async def scrape_and_insert(
         ScrapeResponse(
             runId=run_id,
             requestedTarget=requested_target,
-            providers=providers,
+            providers=active_providers or req.providers,
             mediaMode=req.mediaMode,
             insertedCount=len(inserted_rows),
             skippedCount=skipped,
