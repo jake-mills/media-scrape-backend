@@ -5,4 +5,4 @@ requests==2.32.3
 python-dotenv==1.0.1
 orjson==3.10.7
 pydantic==2.10.3
-gunicorn==21.2.0
+gunicorn==22.0.0
