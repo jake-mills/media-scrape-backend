@@ -13,3 +13,6 @@ orjson==3.10.7
 # Airtable + Pydantic (pinned to avoid conflicts)
 pyairtable==2.3.3
 pydantic==1.10.15
+
+# Process manager
+gunicorn==21.2.0
