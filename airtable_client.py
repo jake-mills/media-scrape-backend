@@ -1,60 +1,72 @@
 # airtable_client.py
-# Lightweight Airtable REST client (no pyairtable dependency).
-# Works on Python 3.13 and with FastAPI/pydantic v2.
+"""
+Minimal Airtable helper (no third-party client).
+Env vars used:
+  AIRTABLE_API_KEY
+  AIRTABLE_BASE_ID
+  AIRTABLE_TABLE_NAME
+"""
 
 from __future__ import annotations
-
 import os
 import json
-from typing import Any, Dict, Optional
+from typing import Dict, Any, Optional, List
+import requests
 
-import httpx
+AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "").strip()
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "").strip()
 
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
+_API_ROOT = "https://api.airtable.com/v0"
 
-if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID or not AIRTABLE_TABLE_NAME:
-    raise RuntimeError(
-        "Airtable env not set. Please define AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME."
-    )
+def _check_env() -> None:
+    missing = [k for k, v in {
+        "AIRTABLE_API_KEY": AIRTABLE_API_KEY,
+        "AIRTABLE_BASE_ID": AIRTABLE_BASE_ID,
+        "AIRTABLE_TABLE_NAME": AIRTABLE_TABLE_NAME,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing required env var(s): {', '.join(missing)}")
 
-_API_ROOT = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{httpx.utils.quote(AIRTABLE_TABLE_NAME)}"
-_HEADERS = {
-    "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-    "Content-Type": "application/json",
-}
-
-
-async def find_by_source_url(source_url: str) -> Optional[Dict[str, Any]]:
-    """
-    Returns the first row whose {Source_URL} exactly matches `source_url`,
-    or None if not found.
-    """
-    # Use a parameterized formula so we don’t fight URL encoding issues.
-    params = {
-        "filterByFormula": f"{{Source_URL}} = '{source_url.replace(\"'\", \"\\'\")}'",
-        "maxRecords": 1,
+def _headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.get(_API_ROOT, headers=_HEADERS, params=params)
-        r.raise_for_status()
-        data = r.json()
-        records = data.get("records", [])
-        return records[0] if records else None
 
+def _url() -> str:
+    return f"{_API_ROOT}/{AIRTABLE_BASE_ID}/{requests.utils.requote_uri(AIRTABLE_TABLE_NAME)}"
 
-async def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
+def _escape_for_formula(value: str) -> str:
+    # Airtable formulas escape single quotes by doubling them
+    return value.replace("'", "''")
+
+def find_by_source_url(source_url: str) -> Optional[Dict[str, Any]]:
     """
-    Inserts a single row. `fields` are the column names/values from your schema.
-    Returns the created Airtable record.
+    Look up a record by exact match on the 'Source_URL' field.
+    Returns the first matching record (dict) or None.
     """
+    _check_env()
+    formula = f"{{Source_URL}} = '{_escape_for_formula(source_url)}'"
+    params = {"filterByFormula": formula, "maxRecords": 1}
+    resp = requests.get(_url(), headers=_headers(), params=params, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    records: List[Dict[str, Any]] = data.get("records", [])
+    return records[0] if records else None
+
+def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Insert a single row (record) into Airtable. 'fields' should be a dict
+    mapping column name -> value (strings, numbers, lists, etc).
+    Returns the created record (dict).
+    """
+    _check_env()
     payload = {"records": [{"fields": fields}], "typecast": True}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post(_API_ROOT, headers=_HEADERS, content=json.dumps(payload))
-        r.raise_for_status()
-        data = r.json()
-        recs = data.get("records", [])
-        if not recs:
-            raise RuntimeError("Airtable insert returned no records.")
-        return recs[0]
+    resp = requests.post(_url(), headers=_headers(), data=json.dumps(payload), timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+    created = data.get("records", [])
+    if not created:
+        raise RuntimeError("Insert succeeded but response had no records")
+    return created[0]
