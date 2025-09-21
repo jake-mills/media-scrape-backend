@@ -22,18 +22,6 @@ async def fetch_openverse(
     page_size: int = 10,
     media: Literal["image", "video"] = "image",
 ) -> List[Dict[str, Any]]:
-    """
-    Calls Openverse and returns a list of dicts with columns:
-      - Media Type
-      - Provider
-      - Thumbnail
-      - Title
-      - Source URL
-      - Published/Created
-      - Copyright
-    (Plus: "Notes" may be added by the caller if desired)
-    """
-
     url = f"{OPENVERSE_BASE}/{_endpoint(media)}/"
     params = {
         "q": topic,
@@ -51,18 +39,12 @@ async def fetch_openverse(
     out: List[Dict[str, Any]] = []
 
     for row in results:
-        # Title: prefer title; fall back to topic
         title = (row.get("title") or "").strip() or topic
-
-        # Prefer direct asset URL; fall back to landing page
         source_url = row.get("url") or row.get("foreign_landing_url")
         if not source_url:
             continue
 
-        # Thumbnail (Openverse often provides a 'thumbnail' for images; videos may have a preview image)
         thumb = row.get("thumbnail") or row.get("url") or ""
-
-        # License and published date if present
         license_code = row.get("license") or ""
         created_on = row.get("created_on") or ""
 
