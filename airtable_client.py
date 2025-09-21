@@ -1,68 +1,60 @@
 # airtable_client.py
-"""
-Airtable client wrapper using pyairtable.
-Centralizes connection and common operations for the Media Scrape backend.
-"""
+# Lightweight Airtable REST client (no pyairtable dependency).
+# Works on Python 3.13 and with FastAPI/pydantic v2.
+
+from __future__ import annotations
 
 import os
-from typing import Optional, Dict, Any, List
-from pyairtable import Table
+import json
+from typing import Any, Dict, Optional
 
-# Load environment variables
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME")
+import httpx
+
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
+
+if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID or not AIRTABLE_TABLE_NAME:
+    raise RuntimeError(
+        "Airtable env not set. Please define AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME."
+    )
+
+_API_ROOT = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{httpx.utils.quote(AIRTABLE_TABLE_NAME)}"
+_HEADERS = {
+    "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+    "Content-Type": "application/json",
+}
 
 
-def get_table() -> Table:
+async def find_by_source_url(source_url: str) -> Optional[Dict[str, Any]]:
     """
-    Returns a configured Airtable Table instance.
-    Raises RuntimeError if required environment variables are missing.
+    Returns the first row whose {Source_URL} exactly matches `source_url`,
+    or None if not found.
     """
-    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
-        raise RuntimeError("Missing Airtable environment variables: "
-                           "AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME")
-    return Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
+    # Use a parameterized formula so we don’t fight URL encoding issues.
+    params = {
+        "filterByFormula": f"{{Source_URL}} = '{source_url.replace(\"'\", \"\\'\")}'",
+        "maxRecords": 1,
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(_API_ROOT, headers=_HEADERS, params=params)
+        r.raise_for_status()
+        data = r.json()
+        records = data.get("records", [])
+        return records[0] if records else None
 
 
-def insert_row(record: Dict[str, Any]) -> Dict[str, Any]:
+async def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Insert a single record into Airtable.
+    Inserts a single row. `fields` are the column names/values from your schema.
+    Returns the created Airtable record.
     """
-    table = get_table()
-    return table.create(record)
-
-
-def insert_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Insert multiple records into Airtable.
-    """
-    table = get_table()
-    return table.batch_create(records)
-
-
-def find_by_source_url(url: str, field: str = "Source_URL") -> Optional[Dict[str, Any]]:
-    """
-    Find a record by its Source_URL (or another field if specified).
-    Returns the first match or None if no match found.
-    """
-    table = get_table()
-    formula = f"{{{field}}} = '{url}'"
-    matches = table.all(formula=formula, max_records=1)
-    return matches[0] if matches else None
-
-
-def update_row(record_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Update an existing record by ID.
-    """
-    table = get_table()
-    return table.update(record_id, fields)
-
-
-def delete_row(record_id: str) -> Dict[str, Any]:
-    """
-    Delete a record by ID.
-    """
-    table = get_table()
-    return table.delete(record_id)
+    payload = {"records": [{"fields": fields}], "typecast": True}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(_API_ROOT, headers=_HEADERS, content=json.dumps(payload))
+        r.raise_for_status()
+        data = r.json()
+        recs = data.get("records", [])
+        if not recs:
+            raise RuntimeError("Airtable insert returned no records.")
+        return recs[0]
