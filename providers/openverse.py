@@ -1,49 +1,81 @@
+# providers/openverse.py
+"""
+Openverse provider (Images + Videos)
+Returns rich, normalized dicts with fields that map 1:1 to your Airtable schema.
+"""
+
 from __future__ import annotations
 
 import httpx
-import logging
-from typing import Literal
+from typing import Literal, Dict, Any, List
 
-log = logging.getLogger("openverse")
+OPENVERSE_BASE = "https://api.openverse.engineering/v1"
 
-
-def _endpoint_for_media(media: Literal["image", "video"]) -> str:
+def _endpoint(media: Literal["image", "video"]) -> str:
     return "images" if media == "image" else "videos"
 
 
-async def fetch_openverse_async(
+async def fetch_openverse(
     *,
-    query: str,
-    media: Literal["image", "video"] = "image",
+    topic: str,
     license_type: str = "commercial",
-    page_size: int = 1,
-    debug: bool = False,
-) -> list[dict]:
+    page_size: int = 10,
+    media: Literal["image", "video"] = "image",
+) -> List[Dict[str, Any]]:
     """
-    Calls Openverse and returns a list of {title, source_url, provider} dicts.
+    Calls Openverse and returns a list of dicts with columns:
+      - Media Type
+      - Provider
+      - Thumbnail
+      - Title
+      - Source URL
+      - Published/Created
+      - Copyright
+    (Plus: "Notes" may be added by the caller if desired)
     """
-    endpoint = _endpoint_for_media(media)
-    url = f"https://api.openverse.engineering/v1/{endpoint}/"
-    params = {"q": query, "license_type": license_type, "page_size": page_size}
+
+    url = f"{OPENVERSE_BASE}/{_endpoint(media)}/"
+    params = {
+        "q": topic,
+        "license_type": license_type,
+        "page_size": max(1, min(int(page_size), 50)),
+    }
     headers = {"User-Agent": "media-scrape-backend/1.0"}
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         r = await client.get(url, params=params, headers=headers)
         r.raise_for_status()
         data = r.json()
 
-    results = data.get("results", [])
-    if debug:
-        log.info("[Openverse] Returning %s item(s)", len(results))
+    results = data.get("results") or []
+    out: List[Dict[str, Any]] = []
 
-    items: list[dict] = []
     for row in results:
-        title = row.get("title") or query
-        # Prefer the direct asset URL; fall back to landing page if needed
-        src = row.get("url") or row.get("foreign_landing_url")
-        if not src:
+        # Title: prefer title; fall back to topic
+        title = (row.get("title") or "").strip() or topic
+
+        # Prefer direct asset URL; fall back to landing page
+        source_url = row.get("url") or row.get("foreign_landing_url")
+        if not source_url:
             continue
-        items.append(
-            {"title": title, "provider": "Openverse", "source_url": src}
+
+        # Thumbnail (Openverse often provides a 'thumbnail' for images; videos may have a preview image)
+        thumb = row.get("thumbnail") or row.get("url") or ""
+
+        # License and published date if present
+        license_code = row.get("license") or ""
+        created_on = row.get("created_on") or ""
+
+        out.append(
+            {
+                "Media Type": "Images" if media == "image" else "Videos",
+                "Provider": "Openverse",
+                "Thumbnail": thumb,
+                "Title": title,
+                "Source URL": source_url,
+                "Published/Created": created_on,
+                "Copyright": license_code,
+            }
         )
-    return items
+
+    return out
