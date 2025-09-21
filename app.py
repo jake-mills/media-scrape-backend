@@ -4,6 +4,8 @@ Media Scrape Backend – FastAPI
 Populates Airtable "Videos & Images" with non-duplicates from Openverse.
 """
 
+from __future__ import annotations
+
 import os
 from typing import List, Optional, Literal, Dict, Any
 
@@ -12,29 +14,28 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from airtable_client import insert_row, find_by_source_url
-from providers.openverse import fetch_openverse  # rich fields for Images/Videos
+from providers.openverse import fetch_openverse  # Images & Videos
 
 # -------------------------------------------------------------------
 # Config / Security
-# -------------------------------------------------------------------
-# Accept either SHORTCUTS_KEY or SHORTCUTS_API_KEY (Render YAML used the latter)
+# Accept either SHORTCUTS_KEY or SHORTCUTS_API_KEY (render.yaml had the latter)
 SHORTCUTS_KEY = (os.getenv("SHORTCUTS_KEY") or os.getenv("SHORTCUTS_API_KEY") or "").strip()
 
+# -------------------------------------------------------------------
+# App
 app = FastAPI(title="Media Scrape Backend", version="1.0.0")
 
-
 # -------------------------------------------------------------------
-# Models (Pydantic v2-compatible)
-# -------------------------------------------------------------------
+# Models (Pydantic v2)
 MediaMode = Literal["Images", "Videos", "Both"]
 
 class ScrapeRequest(BaseModel):
     topic: str = Field(..., description="Search topic/keywords.")
-    searchDates: Optional[str] = Field(None, description="Free-text date range (e.g., '2000-2010').")
-    targetCount: int = Field(1, ge=1, le=50, description="How many unique rows to insert at most.")
+    searchDates: Optional[str] = Field(None, description="Free-text date range, e.g. '2000-2010'.")
+    targetCount: int = Field(1, ge=1, le=50, description="Max number of unique rows to insert.")
     providers: List[str] = Field(..., description="e.g., ['Openverse']")
     mediaMode: MediaMode = Field(..., description="'Images', 'Videos', or 'Both'")
-    runId: Optional[str] = Field(None, description="Client-supplied run id, echoed to Airtable 'Run ID'.")
+    runId: Optional[str] = Field(None, description="Echoed into Airtable 'Run ID'.")
 
 class ScrapeResponse(BaseModel):
     runId: str
@@ -45,10 +46,8 @@ class ScrapeResponse(BaseModel):
     skippedCount: int
     inserted: List[Dict[str, Any]]
 
-
 # -------------------------------------------------------------------
 # Health & Root
-# -------------------------------------------------------------------
 @app.get("/health")
 async def health_get():
     return {"status": "ok"}
@@ -65,10 +64,8 @@ async def root_ok():
 async def root_head():
     return Response(status_code=200)
 
-
 # -------------------------------------------------------------------
 # Main endpoint
-# -------------------------------------------------------------------
 @app.post("/scrape-and-insert", response_model=ScrapeResponse)
 async def scrape_and_insert(
     req: ScrapeRequest,
@@ -87,12 +84,12 @@ async def scrape_and_insert(
     want_images = req.mediaMode in ("Images", "Both")
     want_videos = req.mediaMode in ("Videos", "Both")
 
-    # ---- Supported providers
-    active_providers = []
+    # ---- Call providers
+    active_providers: List[str] = []
     candidates: List[Dict[str, Any]] = []
 
     for p in req.providers:
-        pl = p.lower().strip()
+        pl = (p or "").strip().lower()
         if pl == "openverse":
             active_providers.append("Openverse")
             if want_images:
@@ -109,15 +106,16 @@ async def scrape_and_insert(
                     page_size=max(1, requested_target * 3),
                     media="video",
                 )
-        # (future: add elif pl == "youtube": ...)
+        # (future: elif pl == "youtube": ...)
 
     inserted_rows: List[Dict[str, Any]] = []
     skipped = 0
 
     for item in candidates:
-        # Build Airtable record using your exact column names
+        # Normalize into your exact Airtable schema
         fields: Dict[str, Any] = {
-            "Media Type": item.get("Media Type", "Images" if want_images and not want_videos else "Videos"),
+            "Index": None,  # Autonumber in Airtable
+            "Media Type": item.get("Media Type") or ("Images" if want_images and not want_videos else "Videos"),
             "Provider": item.get("Provider", "Openverse"),
             "Thumbnail": item.get("Thumbnail", ""),
             "Title": item.get("Title") or req.topic,
@@ -133,7 +131,7 @@ async def scrape_and_insert(
         if not fields["Source URL"]:
             continue
 
-        # De-dup: exact match on "Source URL"
+        # Dedupe on exact "Source URL"
         if find_by_source_url(fields["Source URL"]):
             skipped += 1
             continue
