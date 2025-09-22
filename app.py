@@ -1,160 +1,163 @@
-# app.py
-from __future__ import annotations
-
 import os
 import logging
 from typing import List, Literal, Optional, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
-from airtable_client import upsert_items
 from providers.openverse import search_openverse_images
+from airtable_client import insert_row, find_by_source_url
 
-# -----------------------------------------------------------------------------
-# Logging / App
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("media-scrape-backend")
-
+# -------------------------------------------------
+# App setup
+# -------------------------------------------------
 app = FastAPI(title="Media Scrape Backend", version="1.0.0")
+log = logging.getLogger("media-scrape-backend")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],      # tighten if desired
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY")
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-# Support BOTH names to match your render.yaml and earlier code
-SHORTCUTS_KEY = (
-    os.getenv("SHORTCUTS_KEY")
-    or os.getenv("SHORTCUTS_API_KEY")
-    or ""
-).strip()
-if not SHORTCUTS_KEY:
-    log.warning("SHORTCUTS_KEY/SHORTCUTS_API_KEY not set; /scrape-and-insert will 401.")
-
-# -----------------------------------------------------------------------------
-# Models (Pydantic v2)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# Models
+# -------------------------------------------------
 MediaMode = Literal["Images", "Videos"]
-SupportedProvider = Literal["Openverse"]  # extend later
+ProviderName = Literal["Openverse"]  # extend as you add providers
 
 class ScrapeRequest(BaseModel):
-    topic: str = Field(..., description="Search topic/keywords")
-    targetCount: int = Field(ge=1, le=100, description="Max new rows to insert")
-    providers: List[SupportedProvider] = Field(..., description='e.g., ["Openverse"]')
-    mediaMode: MediaMode = Field(..., description='"Images" or "Videos"')
-    searchDates: Optional[str] = Field(None, description='Optional hint like "2000-2010"')
-    runId: Optional[str] = Field(None, description="Optional client trace id")
+    topic: str = Field(..., min_length=1)
+    targetCount: int = Field(..., ge=1, le=50)
+    providers: List[ProviderName]
+    mediaMode: MediaMode
+    runId: str = Field(..., min_length=1)
 
-    @field_validator("topic")
-    @classmethod
-    def topic_not_blank(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("topic cannot be blank")
-        return v.strip()
+    # NEW: Optional metadata you wanted to store verbatim in Airtable
+    searchTopics: Optional[str] = None
+    searchDates: Optional[str] = None
 
-class InsertEcho(BaseModel):
-    id: Optional[str] = None
-    fields: Dict[str, Any] = {}
+class InsertedItem(BaseModel):
+    title: Optional[str] = None
+    provider: Optional[str] = None
     source_url: Optional[str] = None
+    thumbnailURL: Optional[str] = None
+    copyright: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    tags: Optional[str] = None
 
-class ScrapeSummary(BaseModel):
-    runId: Optional[str] = None
+class ScrapeResult(BaseModel):
+    runId: str
     requestedTarget: int
     providers: List[str]
     mediaMode: MediaMode
     insertedCount: int
     skippedCount: int
-    inserted: List[InsertEcho] = []
+    inserted: List[InsertedItem]
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def ensure_key(xkey: str) -> None:
-    if not SHORTCUTS_KEY or xkey != SHORTCUTS_KEY:
-        raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key.")
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+# -------------------------------------------------
+# Health
+# -------------------------------------------------
 @app.get("/health")
-async def health() -> Dict[str, str]:
+def health():
     return {"status": "ok"}
 
-@app.post("/scrape-and-insert", response_model=ScrapeSummary)
-async def scrape_and_insert(
-    body: ScrapeRequest,
-    x_shortcuts_key: str = Header(..., alias="X-Shortcuts-Key"),
-):
-    ensure_key(x_shortcuts_key)
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
+def require_shortcuts_key(header_value: Optional[str]):
+    if not SHORTCUTS_KEY:
+        log.warning("SHORTCUTS_KEY not set in environment; refusing all writes.")
+        raise HTTPException(status_code=500, detail="Server not configured.")
+    if header_value != SHORTCUTS_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
 
-    # Collect normalized items from provider(s)
-    items: List[Dict[str, Any]] = []
-    for prov in body.providers:
-        if prov == "Openverse":
-            if body.mediaMode != "Images":
-                raise HTTPException(
-                    status_code=400,
-                    detail='Openverse currently supports mediaMode="Images" only.',
-                )
+# -------------------------------------------------
+# Main route
+# -------------------------------------------------
+@app.post("/scrape-and-insert", response_model=ScrapeResult)
+async def scrape_and_insert(
+    payload: ScrapeRequest,
+    x_shortcuts_key: Optional[str] = Header(None, convert_underscores=False),
+):
+    # Auth
+    require_shortcuts_key(x_shortcuts_key)
+
+    # Only Openverse for now (your other providers can be added later)
+    all_new: List[Dict[str, Any]] = []
+    skipped = 0
+
+    for provider in payload.providers:
+        if provider == "Openverse":
             try:
                 batch = await search_openverse_images(
-                    topic=body.topic,
-                    target_count=max(10, body.targetCount),  # overfetch a bit for de-dup
-                    license_type="commercial",
+                    query=payload.topic,
+                    count=payload.targetCount * 4,  # over-fetch to allow filtering/dedup
                 )
-                items.extend(batch)
-            except Exception as e:
-                log.exception("Openverse failed: %s", e)
-                raise HTTPException(status_code=502, detail=f"Provider Openverse failed: {e}")
+            except Exception as exc:
+                # surface a friendly message (keeps your 2xx schema stable)
+                msg = f"Provider Openverse failed: {exc}"
+                log.error(msg)
+                raise HTTPException(status_code=502, detail=msg)
+
+            # write/skip with Airtable de-dup by Source URL
+            for idx, item in enumerate(batch):
+                if len(all_new) >= payload.targetCount:
+                    break
+
+                # Map into your Airtable columns exactly as you requested
+                fields_for_airtable = {
+                    "Index": idx + 1,  # per-run index
+                    "Media Type": "Image" if payload.mediaMode == "Images" else "Video",
+                    "Provider": "Openverse",
+                    "Thumbnail": item.get("thumbnailURL"),
+                    "Title": item.get("title"),
+                    "Source URL": item.get("source_url"),
+                    "Search Topics Used": payload.searchTopics,
+                    "Search Dates Used": payload.searchDates,
+                    "Published/Created": item.get("published") or item.get("created"),
+                    "Copyright": item.get("copyright"),
+                    "Run ID": payload.runId,
+                    "Notes": None,
+                }
+
+                # If Source URL missing, skip early
+                src = fields_for_airtable["Source URL"]
+                if not src:
+                    continue
+
+                # de-dup by Source URL
+                existing = find_by_source_url(src)
+                if existing:
+                    skipped += 1
+                    continue
+
+                # insert
+                ok = insert_row(fields_for_airtable)
+                if ok:
+                    all_new.append(
+                        {
+                            "title": item.get("title"),
+                            "provider": "Openverse",
+                            "source_url": src,
+                            "thumbnailURL": item.get("thumbnailURL"),
+                            "copyright": item.get("copyright"),
+                            "width": item.get("width"),
+                            "height": item.get("height"),
+                            "tags": item.get("tags"),
+                        }
+                    )
+                else:
+                    skipped += 1
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported provider: {prov}")
+            # future providers can be added here
+            log.info("Provider %s is not implemented yet; skipping.", provider)
+            continue
 
-    if not items:
-        return ScrapeSummary(
-            runId=body.runId,
-            requestedTarget=body.targetCount,
-            providers=body.providers,
-            mediaMode=body.mediaMode,
-            insertedCount=0,
-            skippedCount=0,
-            inserted=[],
-        )
-
-    # Upsert to Airtable (de-dup by "Source URL")
-    try:
-        summary = upsert_items(
-            items,
-            run_id=body.runId or "",
-            search_topics_used=body.topic,
-            search_dates_used=body.searchDates or "",
-            target_count=body.targetCount,
-        )
-    except Exception as e:
-        log.exception("Airtable upsert_items failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"Airtable error: {e}")
-
-    return ScrapeSummary(
-        runId=body.runId,
-        requestedTarget=body.targetCount,
-        providers=body.providers,
-        mediaMode=body.mediaMode,
-        insertedCount=int(summary.get("insertedCount", 0)),
-        skippedCount=int(summary.get("skippedCount", 0)),
-        inserted=[InsertEcho(**rec) for rec in summary.get("inserted", [])],
+    return ScrapeResult(
+        runId=payload.runId,
+        requestedTarget=payload.targetCount,
+        providers=payload.providers,
+        mediaMode=payload.mediaMode,
+        insertedCount=len(all_new),
+        skippedCount=skipped,
+        inserted=[InsertedItem(**row) for row in all_new],
     )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
