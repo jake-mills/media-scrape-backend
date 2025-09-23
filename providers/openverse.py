@@ -1,67 +1,62 @@
 # providers/openverse.py
-"""
-Openverse provider (Images + Videos). No API key required.
-If OPENVERSE_API_KEY is present, it will be sent as Authorization: Bearer <key>.
-Returns list of dicts matching your Airtable columns.
-"""
 from __future__ import annotations
-
+from typing import Dict, List, Optional, Tuple
 import os
-from typing import Literal, Dict, Any, List, Optional
 import httpx
 
-OPENVERSE_BASE = "https://api.openverse.engineering/v1"
+OPENVERSE_BASE = "https://api.openverse.org/v1"
 
-def _endpoint(media: Literal["image","video"]) -> str:
-    return "images" if media == "image" else "videos"
+class OpenverseClient:
+    """
+    Async Openverse client (images).
+    - Works without auth.
+    - If OPENVERSE_TOKEN is set, we send Authorization: Bearer <token>.
+    """
 
-async def search_openverse(*, topic: str, media: Literal["image","video"], limit: int, debug: bool=False) -> List[Dict[str, Any]]:
-    params = {
-        "q": topic,
-        "page_size": min(max(limit, 1), 60),
-        "license_type": "commercial",
-    }
-    headers = {"Accept": "application/json"}
-    api_key = os.getenv("OPENVERSE_API_KEY")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    def __init__(self, token: Optional[str] = None, timeout: float = 20.0):
+        self.token = token
+        self.timeout = timeout
 
-    url = f"{OPENVERSE_BASE}/{_endpoint(media)}"
+    async def search_images(self, topic: str, target_count: int = 10) -> Tuple[str, List[Dict]]:
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, params=params, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+        page_size = min(max(target_count, 1), 50)
+        url = f"{OPENVERSE_BASE}/images"
+        params = {"q": topic, "page_size": page_size}
 
-    results = data.get("results", []) if isinstance(data, dict) else []
-    out: List[Dict[str, Any]] = []
-    for item in results:
-        title = item.get("title") or ""
-        source_url = item.get("url") or ""
-        thumb = item.get("thumbnail") or item.get("thumbnail_url") or ""
-        created_on = item.get("created_on") or item.get("created") or ""
-        license_code = item.get("license") or ""
-        creator = item.get("creator") or ""
-        # Build friendly copyright string
-        copyright_str = ""
-        if license_code and creator:
-            copyright_str = f"{license_code.upper()} — {creator}"
-        elif license_code:
-            copyright_str = license_code.upper()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(url, params=params, headers=headers)
+            if r.status_code == 401:
+                raise RuntimeError("Openverse 401 Unauthorized — set OPENVERSE_TOKEN in your env if required.")
+            r.raise_for_status()
+            data = r.json()
 
-        out.append({
-            "Media Type": "Images" if media == "image" else "Videos",
-            "Provider": "Openverse",
-            "Thumbnail": thumb,
-            "Title": title,
-            "Source URL": source_url,
-            "Published/Created": created_on,
-            "Copyright": copyright_str,
-            # Leave these blank by default; app.py may fill Search/Run columns.
-            "Notes": "",
-        })
+        items: List[Dict] = []
+        for row in data.get("results", []):
+            title = row.get("title") or ""
+            landing = row.get("foreign_landing_url") or row.get("url") or ""
+            thumb = row.get("thumbnail") or row.get("url") or ""
+            creator = row.get("creator") or ""
+            license_code = row.get("license") or ""
 
-    if debug:
-        print(f"[Openverse] topic={topic} media={media} fetched={len(out)}")
+            if creator and license_code:
+                copyright_str = f"{creator} — {license_code.upper()}"
+            elif license_code:
+                copyright_str = license_code.upper()
+            else:
+                copyright_str = creator
 
-    return out
+            items.append({
+                "media_type": "Images",
+                "provider": "Openverse",
+                "title": title,
+                "source_url": landing,
+                "thumbnail": thumb,
+                "published": "",   # Often not available for images
+                "copyright": copyright_str,
+                "notes": "",
+            })
+
+        return ("Openverse", items)
