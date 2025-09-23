@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # cache-buster to force a fresh pip layer when requirements change
-ARG CACHEBUST=1
+ARG CACHEBUST=2
 
 WORKDIR /app
 COPY requirements.txt .
