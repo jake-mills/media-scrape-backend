@@ -2,131 +2,145 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from typing import List, Literal, Optional, Dict, Any
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-import httpx
+from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from airtable_client import insert_row, find_by_source_url
-from providers.openverse import search_openverse
+from airtable_client import find_by_source_url, insert_row
+from providers.openverse import OpenverseClient
+try:
+    from providers.youtube import YouTubeClient  # optional
+except Exception:
+    YouTubeClient = None  # if you don't use YouTube, this is fine
 
 APP_VERSION = "1.0.0"
 
-REQUIRED_ENV = ["AIRTABLE_API_KEY", "AIRTABLE_BASE_ID", "AIRTABLE_TABLE_NAME", "SHORTCUTS_KEY"]
-for k in REQUIRED_ENV:
-    if not os.getenv(k):
-        raise RuntimeError(f"Missing required environment variable: {k}")
+# ---------- Env ----------
+SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Videos & Images").strip()
+OPENVERSE_TOKEN = os.getenv("OPENVERSE_TOKEN", "").strip()
 
+for key in ("AIRTABLE_API_KEY", "AIRTABLE_BASE_ID", "AIRTABLE_TABLE_NAME"):
+    if not os.getenv(key):
+        raise RuntimeError(f"Missing required env var: {key}")
+
+# ---------- App ----------
 app = FastAPI(title="Media Scrape Backend", version=APP_VERSION)
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(_, exc: Exception):
+    return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})
+
+@app.get("/health")
+async def health_get():
+    return {"status": "ok", "version": APP_VERSION}
+
+@app.head("/health")
+async def health_head():
+    return Response(status_code=200)
+
+@app.get("/")
+async def root():
+    return {"ok": True, "version": APP_VERSION}
+
+# ---------- Models ----------
+MediaMode = Literal["Images", "Videos", "Both"]
 
 class ScrapeRequest(BaseModel):
     topic: str
-    targetCount: int
-    providers: List[str]
-    mediaMode: Literal["Images", "Videos"]
-    runId: str
-    # Optional echo-through to Airtable columns if provided
+    searchDates: Optional[str] = None
+    targetCount: int = Field(10, ge=1, le=200)
+    providers: List[str] = Field(default_factory=lambda: ["Openverse"])
+    mediaMode: MediaMode = "Images"
+    runId: Optional[str] = None
     searchTopicsUsed: Optional[str] = None
     searchDatesUsed: Optional[str] = None
 
-class InsertedItem(BaseModel):
-    title: Optional[str] = None
-    provider: Optional[str] = None
-    source_url: Optional[str] = None
-    thumbnailURL: Optional[str] = None
+class ScrapeResult(BaseModel):
+    inserted: int
+    skipped_duplicates: int
+    provider_counts: Dict[str, int]
 
-class InsertEcho(BaseModel):
-    runId: str
-    requestedTarget: int
-    providers: List[str]
-    mediaMode: Literal["Images", "Videos"]
-    insertedCount: int
-    skippedCount: int
-    inserted: List[Dict[str, Any]]
+def _require_shortcuts_key(header_key: Optional[str]):
+    if not SHORTCUTS_KEY:
+        return  # allow missing header if you intentionally didn't set the secret
+    if not header_key or header_key.strip() != SHORTCUTS_KEY:
+        raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key")
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": APP_VERSION}
+# ---------- Route ----------
+@app.post("/scrape-and-insert", response_model=ScrapeResult)
+async def scrape_and_insert(
+    body: ScrapeRequest,
+    x_shortcuts_key: Optional[str] = Header(default=None, convert_underscores=False),
+):
+    _require_shortcuts_key(x_shortcuts_key)
 
-@app.post("/scrape-and-insert", response_model=InsertEcho)
-async def scrape_and_insert(payload: ScrapeRequest, x_shortcuts_key: str = Header(alias="X-Shortcuts-Key")):
-    if x_shortcuts_key != os.getenv("SHORTCUTS_KEY"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    topic = (body.topic or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic is required")
 
-    media = "image" if payload.mediaMode.lower().startswith("image") else "video"
-    target = max(0, int(payload.targetCount))
+    want_images = body.mediaMode in ("Images", "Both")
+    want_videos = body.mediaMode in ("Videos", "Both")
 
-    # Collect candidates from providers (Openverse for now)
-    results: List[Dict[str, Any]] = []
-    errors: List[str] = []
+    target = max(1, body.targetCount)
+    inserted = 0
+    skipped = 0
+    provider_counts: Dict[str, int] = {}
 
-    for provider in payload.providers:
-        prov = provider.lower().strip()
-        try:
-            if prov == "openverse":
-                items = await search_openverse(
-                    topic=payload.topic,
-                    media=media,
-                    limit=target,
-                    debug=bool(int(os.getenv("DEBUG_OPENVERSE", "0")))
-                )
-                results.extend(items)
-            else:
-                errors.append(f"Provider {provider} not yet implemented")
-        except httpx.HTTPError as e:
-            errors.append(f"Provider {provider} failed: {str(e)}")
+    # columns you want set from request
+    search_topics_used = body.searchTopicsUsed or body.topic
+    search_dates_used = body.searchDatesUsed or body.searchDates or ""
 
-    # De-dup by Source URL and enforce target
-    seen = set()
-    unique: List[Dict[str, Any]] = []
-    for r in results:
-        url = r.get("Source URL")
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        unique.append(r)
-        if len(unique) >= target:
+    tasks = []
+
+    # Openverse (images)
+    if want_images and any(p.lower() == "openverse" for p in body.providers):
+        tasks.append(OpenverseClient(token=OPENVERSE_TOKEN or None).search_images(topic, target))
+
+    # YouTube (videos) - optional
+    if want_videos and any(p.lower() == "youtube" for p in body.providers):
+        if not YouTubeClient:
+            raise HTTPException(status_code=400, detail="YouTube provider unavailable (module not present).")
+        tasks.append(YouTubeClient().search_videos(topic, target))
+
+    results = await asyncio.gather(*tasks) if tasks else []
+
+    for provider_name, items in results:
+        provider_counts.setdefault(provider_name, 0)
+        for item in items:
+            fields = {
+                "Media Type": item.get("media_type") or ("Images" if want_images else "Videos"),
+                "Provider": provider_name,
+                "Thumbnail": item.get("thumbnail") or "",
+                "Title": item.get("title") or "",
+                "Source URL": item.get("source_url") or "",
+                "Search Topics Used": search_topics_used,
+                "Search Dates Used": search_dates_used,
+                "Published/Created": item.get("published") or "",
+                "Copyright": item.get("copyright") or "",
+                "Run ID": body.runId or "",
+                "Notes": item.get("notes") or "",
+            }
+
+            # de-dup by exact Source URL
+            src = fields["Source URL"]
+            if src:
+                if find_by_source_url(src):
+                    skipped += 1
+                    continue
+
+            insert_row(fields)
+            inserted += 1
+            provider_counts[provider_name] += 1
+
+            if inserted >= target:
+                break
+        if inserted >= target:
             break
 
-    inserted_count = 0
-    skipped_count = 0
-    inserted_rows: List[Dict[str, Any]] = []
-
-    # add run + optional search metadata
-    for idx, row in enumerate(unique, start=1):
-        row["Run ID"] = payload.runId
-        if payload.searchTopicsUsed:
-            row["Search Topics Used"] = payload.searchTopicsUsed
-        if payload.searchDatesUsed:
-            row["Search Dates Used"] = payload.searchDatesUsed
-
-        existing = find_by_source_url(row.get("Source URL"))
-        if existing:
-            skipped_count += 1
-            continue
-
-        rec = insert_row(row)
-        if rec:
-            inserted_count += 1
-            inserted_rows.append({
-                "title": row.get("Title"),
-                "provider": row.get("Provider"),
-                "source_url": row.get("Source URL"),
-                "thumbnailURL": row.get("Thumbnail")
-            })
-        else:
-            errors.append("Unknown Airtable insert failure")
-
-    if errors and inserted_count == 0:
-        raise HTTPException(status_code=502, detail="; ".join(errors))
-
-    return InsertEcho(
-        runId=payload.runId,
-        requestedTarget=payload.targetCount,
-        providers=payload.providers,
-        mediaMode=payload.mediaMode,
-        insertedCount=inserted_count,
-        skippedCount=skipped_count,
-        inserted=inserted_rows,
-    )
+    return ScrapeResult(inserted=inserted, skipped_duplicates=skipped, provider_counts=provider_counts)
