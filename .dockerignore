@@ -1,0 +1,23 @@
+# Ignore Python cache and build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Ignore OS files
+.DS_Store
+
+# Git
+.git
+.gitignore
+
+# Other configs not needed in container
+*.log
