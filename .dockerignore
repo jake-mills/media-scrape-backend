@@ -1,10 +1,9 @@
 .git
-**/__pycache__/
+__pycache__/
 *.pyc
-venv
+*.pyo
+*.pyd
 .env
+.env.*
 .DS_Store
 *.log
-node_modules
-*.zip
-*.tgz
