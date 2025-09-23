@@ -1,0 +1,17 @@
+.gcloudignore
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+*.log
+.DS_Store
+.vscode/
+.idea/
+node_modules/
+venv/
+.venv/
+google-cloud-sdk/
