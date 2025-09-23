@@ -1,7 +1,8 @@
 FROM python:3.12-slim
-
 WORKDIR /app
-ARG CACHEBUST=1
+
+# add this line before requirements install to break cache
+COPY buildstamp.txt .
 
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
