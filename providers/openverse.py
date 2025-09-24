@@ -1,62 +1,118 @@
-# providers/openverse.py
+"""
+Openverse provider.
+
+Implements an async `search(topic, media_mode, target_count)` API that
+returns a list of normalized media items for the app to insert.
+"""
+
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple
+
 import os
+from typing import Any, Dict, List
+
 import httpx
 
-OPENVERSE_BASE = "https://api.openverse.org/v1"
+OPENVERSE_BASE = "https://api.openverse.engineering/v1"
 
-class OpenverseClient:
+# Map our media_mode to the Openverse collection
+_COLLECTION_BY_MODE = {
+    "Images": "images",
+    "Image": "images",
+    "Videos": "videos",
+    "Video": "videos",
+}
+
+
+def _norm_image(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an Openverse image record to the shape the app expects."""
+    # Openverse image fields: id, title, url (landing), thumbnail, creator, source, license, etc.
+    return {
+        "provider": "Openverse",
+        "mediaMode": "Images",
+        "title": item.get("title") or item.get("id"),
+        "source_url": item.get("url"),           # page on the creator/source site
+        "media_url": item.get("thumbnail") or item.get("url"),  # something viewable
+        "thumbnail_url": item.get("thumbnail") or item.get("url"),
+        "author": item.get("creator"),
+        "license": item.get("license"),
+        "raw": item,  # keep full record for debugging
+    }
+
+
+def _norm_video(item: Dict[str, Any]) -> Dict[str, Any]:
+    # Openverse video has similar keys; we still expose a usable media_url if present
+    return {
+        "provider": "Openverse",
+        "mediaMode": "Videos",
+        "title": item.get("title") or item.get("id"),
+        "source_url": item.get("url"),
+        "media_url": item.get("thumbnail") or item.get("url"),
+        "thumbnail_url": item.get("thumbnail") or item.get("url"),
+        "author": item.get("creator"),
+        "license": item.get("license"),
+        "raw": item,
+    }
+
+
+async def search(topic: str, media_mode: str, target_count: int) -> List[Dict[str, Any]]:
     """
-    Async Openverse client (images).
-    - Works without auth.
-    - If OPENVERSE_TOKEN is set, we send Authorization: Bearer <token>.
+    Search Openverse for `topic` and return up to `target_count` normalized items.
+
+    Args
+    ----
+    topic: search query string
+    media_mode: "Images" or "Videos" (case-insensitive accepted)
+    target_count: max number of items to return (>=1)
+
+    Returns
+    -------
+    List[dict] of normalized items
     """
+    mode_key = (media_mode or "").strip().title()
+    collection = _COLLECTION_BY_MODE.get(mode_key, "images")
 
-    def __init__(self, token: Optional[str] = None, timeout: float = 20.0):
-        self.token = token
-        self.timeout = timeout
+    # page size 1..50 (Openverse caps at 50)
+    page_size = max(1, min(50, int(target_count or 1)))
 
-    async def search_images(self, topic: str, target_count: int = 10) -> Tuple[str, List[Dict]]:
-        headers = {"Accept": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+    headers = {}
+    api_key = os.getenv("OPENVERSE_API_KEY") or os.getenv("OPENVERSE_KEY")
+    if api_key:
+        # Openverse currently supports optional API keys for higher quotas
+        headers["Authorization"] = f"Bearer {api_key}"
 
-        page_size = min(max(target_count, 1), 50)
-        url = f"{OPENVERSE_BASE}/images"
-        params = {"q": topic, "page_size": page_size}
+    params = {
+        "q": topic,
+        "page_size": page_size,
+        # Feel free to tweak filters if you want only CC-licensed, etc.
+        # "license_type": "all",  # default
+        # "license": "cc0,by",   # example
+    }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.get(url, params=params, headers=headers)
-            if r.status_code == 401:
-                raise RuntimeError("Openverse 401 Unauthorized — set OPENVERSE_TOKEN in your env if required.")
-            r.raise_for_status()
-            data = r.json()
+    url = f"{OPENVERSE_BASE}/{collection}/"
+    items: List[Dict[str, Any]] = []
 
-        items: List[Dict] = []
-        for row in data.get("results", []):
-            title = row.get("title") or ""
-            landing = row.get("foreign_landing_url") or row.get("url") or ""
-            thumb = row.get("thumbnail") or row.get("url") or ""
-            creator = row.get("creator") or ""
-            license_code = row.get("license") or ""
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # We’ll keep paging until we hit target_count or run out
+        next_url: str | None = url
+        next_params = params
 
-            if creator and license_code:
-                copyright_str = f"{creator} — {license_code.upper()}"
-            elif license_code:
-                copyright_str = license_code.upper()
-            else:
-                copyright_str = creator
+        while next_url and len(items) < target_count:
+            resp = await client.get(next_url, params=next_params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
-            items.append({
-                "media_type": "Images",
-                "provider": "Openverse",
-                "title": title,
-                "source_url": landing,
-                "thumbnail": thumb,
-                "published": "",   # Often not available for images
-                "copyright": copyright_str,
-                "notes": "",
-            })
+            results = data.get("results", [])
+            if not isinstance(results, list):
+                break
 
-        return ("Openverse", items)
+            for r in results:
+                norm = _norm_image(r) if collection == "images" else _norm_video(r)
+                items.append(norm)
+                if len(items) >= target_count:
+                    break
+
+            # pagination
+            next_url = data.get("next")
+            next_params = None  # when "next" is an absolute URL, we don’t pass params again
+
+    return items
