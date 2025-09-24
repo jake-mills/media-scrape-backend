@@ -4,7 +4,7 @@ import hmac
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from airtable_client import insert_record, find_by_source_url
+from airtable_client import insert_row as insert_record, find_by_source_url
 from providers import openverse
 
 app = FastAPI(title="Media Scrape Backend", version="1.0.0")
