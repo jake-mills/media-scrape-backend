@@ -1,5 +1,6 @@
 .git
 .gitignore
+.gcloudignore
 __pycache__/
 *.pyc
 *.pyo
