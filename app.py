@@ -1,158 +1,88 @@
 # app.py
-from __future__ import annotations
-
 import os
-import asyncio
-from typing import List, Literal, Optional, Dict, Any
-
-from fastapi import FastAPI, Header, HTTPException, Response
+import hmac
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
-from airtable_client import find_by_source_url, insert_row
-from providers.openverse import OpenverseClient
-try:
-    from providers.youtube import YouTubeClient  # optional
-except Exception:
-    YouTubeClient = None  # if you don't use YouTube, this is fine
+from airtable_client import insert_record, find_by_source_url
+from providers import openverse
 
-APP_VERSION = "1.0.0"
+app = FastAPI(title="Media Scrape Backend", version="1.0.0")
 
-# ---------- Env ----------
-SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
-AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Videos & Images").strip()
-OPENVERSE_TOKEN = os.getenv("OPENVERSE_TOKEN", "").strip()
+# --- Auth setup ---
+EXPECTED_KEY = (os.getenv("SHORTCUTS_KEY") or "").strip()
 
-for key in ("AIRTABLE_API_KEY", "AIRTABLE_BASE_ID", "AIRTABLE_TABLE_NAME"):
-    if not os.getenv(key):
-        raise RuntimeError(f"Missing required env var: {key}")
+def _get_shortcuts_key(req: Request) -> str:
+    h = req.headers
+    return (h.get("x-shortcuts-key") or h.get("X-Shortcuts-Key") or h.get("shortcuts-key") or "").strip()
 
-# ---------- App ----------
-app = FastAPI(title="Media Scrape Backend", version=APP_VERSION)
+def _is_key_ok(got: str) -> bool:
+    return hmac.compare_digest(got, EXPECTED_KEY)
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(_, exc: Exception):
-    return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})
+@app.middleware("http")
+async def require_shortcuts_key(request: Request, call_next):
+    # Allow health + debug without key
+    if request.url.path not in ("/health", "/__debug_key", "/openapi.json", "/", "/docs", "/redoc"):
+        got = _get_shortcuts_key(request)
+        if not EXPECTED_KEY:
+            return JSONResponse({"detail": "Server missing SHORTCUTS_KEY"}, status_code=500)
+        if not _is_key_ok(got):
+            return JSONResponse({"detail": "Invalid X-Shortcuts-Key"}, status_code=401)
+    return await call_next(request)
 
+# --- Health + Debug ---
 @app.get("/health")
-async def health_get():
-    return {"status": "ok", "version": APP_VERSION}
+async def health():
+    return {"status": "ok", "version": app.version}
 
-@app.head("/health")
-async def health_head():
-    return Response(status_code=200)
+@app.get("/__debug_key")
+async def debug_key(request: Request):
+    got = _get_shortcuts_key(request)
+    def mask(s: str) -> str:
+        if not s: return ""
+        if len(s) <= 6: return "*" * len(s)
+        return s[:3] + "…" + s[-3:]
+    return {
+        "env_present": bool(EXPECTED_KEY),
+        "env_masked": mask(EXPECTED_KEY),
+        "header_present": bool(got),
+        "header_masked": mask(got),
+        "equal": _is_key_ok(got),
+    }
 
-@app.get("/")
-async def root():
-    return {"ok": True, "version": APP_VERSION}
+# --- Scrape + Insert route ---
+@app.post("/scrape-and-insert")
+async def scrape_and_insert(payload: dict, request: Request):
+    topic = payload.get("topic")
+    target_count = payload.get("targetCount", 1)
+    providers = payload.get("providers", ["Openverse"])
+    media_mode = payload.get("mediaMode", "Images")
+    run_id = payload.get("runId", "manual")
 
-# ---------- Models ----------
-MediaMode = Literal["Images", "Videos", "Both"]
-
-class ScrapeRequest(BaseModel):
-    topic: str
-    # the names your Shortcut/curl already send:
-    searchTopics: Optional[str] = None
-    searchDates: Optional[str] = None
-    # optional explicit “Used” fields (if you ever want to override)
-    searchTopicsUsed: Optional[str] = None
-    searchDatesUsed: Optional[str] = None
-
-    targetCount: int = Field(10, ge=1, le=200)
-    providers: List[str] = Field(default_factory=lambda: ["Openverse"])
-    mediaMode: MediaMode = "Images"
-    runId: Optional[str] = None
-
-class ScrapeResult(BaseModel):
-    inserted: int
-    skipped_duplicates: int
-    provider_counts: Dict[str, int]
-
-def _require_shortcuts_key(any_header_value: Optional[str]):
-    """
-    Enforce the shared secret if SHORTCUTS_KEY is set in the environment.
-    Accepts X-Shortcuts-Key / x_shortcuts_key / SHORTCUTS_KEY headers.
-    """
-    if not SHORTCUTS_KEY:
-        return  # secret disabled -> allow all (useful during local testing)
-    if not any_header_value or any_header_value.strip() != SHORTCUTS_KEY:
-        raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key")
-
-# ---------- Route ----------
-@app.post("/scrape-and-insert", response_model=ScrapeResult)
-async def scrape_and_insert(
-    body: ScrapeRequest,
-    # Accept common spellings for the header:
-    x_shortcuts_key_hyphen: Optional[str] = Header(default=None, alias="X-Shortcuts-Key"),
-    x_shortcuts_key_underscore: Optional[str] = Header(default=None, alias="x_shortcuts_key"),
-    x_shortcuts_key_plain: Optional[str] = Header(default=None, alias="SHORTCUTS_KEY"),
-):
-    # pick whichever arrived
-    header_key = x_shortcuts_key_hyphen or x_shortcuts_key_underscore or x_shortcuts_key_plain
-    _require_shortcuts_key(header_key)
-
-    topic = (body.topic or "").strip()
-    if not topic:
-        raise HTTPException(status_code=400, detail="topic is required")
-
-    want_images = body.mediaMode in ("Images", "Both")
-    want_videos = body.mediaMode in ("Videos", "Both")
-
-    target = max(1, body.targetCount)
-    inserted = 0
-    skipped = 0
-    provider_counts: Dict[str, int] = {}
-
-    # columns you want set from request; prefer explicit “Used”, then raw fields, then topic
-    search_topics_used = (body.searchTopicsUsed or body.searchTopics or body.topic or "").strip()
-    search_dates_used = (body.searchDatesUsed or body.searchDates or "").strip()
-
-    tasks = []
-
-    # Openverse (images)
-    if want_images and any(p.lower() == "openverse" for p in body.providers):
-        tasks.append(OpenverseClient(token=OPENVERSE_TOKEN or None).search_images(topic, target))
-
-    # YouTube (videos) - optional
-    if want_videos and any(p.lower() == "youtube" for p in body.providers):
-        if not YouTubeClient:
-            raise HTTPException(status_code=400, detail="YouTube provider unavailable (module not present).")
-        tasks.append(YouTubeClient().search_videos(topic, target))
-
-    results = await asyncio.gather(*tasks) if tasks else []
-
-    for provider_name, items in results:
-        provider_counts.setdefault(provider_name, 0)
-        for item in items:
-            fields: Dict[str, Any] = {
-                "Media Type": item.get("media_type") or ("Images" if want_images else "Videos"),
-                "Provider": provider_name,
-                "Thumbnail": item.get("thumbnail") or "",
-                "Title": item.get("title") or "",
-                "Source URL": item.get("source_url") or "",
-                "Search Topics Used": search_topics_used,
-                "Search Dates Used": search_dates_used,
-                "Published/Created": item.get("published") or "",
-                "Copyright": item.get("copyright") or "",
-                "Run ID": body.runId or "",
-                "Notes": item.get("notes") or "",
-            }
-
-            # de-dup by exact Source URL
-            src = fields["Source URL"]
-            if src and find_by_source_url(src):
-                skipped += 1
+    results = []
+    if "Openverse" in providers:
+        items = await openverse.search(topic, media_mode, target_count)
+        for idx, item in enumerate(items, start=1):
+            # de-dupe by Source URL
+            existing = find_by_source_url(item["url"])
+            if existing:
                 continue
 
-            insert_row(fields)
-            inserted += 1
-            provider_counts[provider_name] += 1
+            record = {
+                "Index": idx,
+                "Media Type": media_mode,
+                "Provider": "Openverse",
+                "Thumbnail": item.get("thumbnail"),
+                "Title": item.get("title"),
+                "Source URL": item.get("url"),
+                "Search Topics Used": topic,
+                "Search Dates Used": payload.get("searchDates", ""),
+                "Published/Created": item.get("published"),
+                "Copyright": item.get("license"),
+                "Run ID": run_id,
+                "Notes": "",
+            }
+            insert_record(record)
+            results.append(record)
 
-            if inserted >= target:
-                break
-        if inserted >= target:
-            break
-
-    return ScrapeResult(inserted=inserted, skipped_duplicates=skipped, provider_counts=provider_counts)
+    return {"inserted": len(results), "results": results}
