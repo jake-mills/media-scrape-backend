@@ -53,32 +53,45 @@ MediaMode = Literal["Images", "Videos", "Both"]
 
 class ScrapeRequest(BaseModel):
     topic: str
+    # the names your Shortcut/curl already send:
+    searchTopics: Optional[str] = None
     searchDates: Optional[str] = None
+    # optional explicit “Used” fields (if you ever want to override)
+    searchTopicsUsed: Optional[str] = None
+    searchDatesUsed: Optional[str] = None
+
     targetCount: int = Field(10, ge=1, le=200)
     providers: List[str] = Field(default_factory=lambda: ["Openverse"])
     mediaMode: MediaMode = "Images"
     runId: Optional[str] = None
-    searchTopicsUsed: Optional[str] = None
-    searchDatesUsed: Optional[str] = None
 
 class ScrapeResult(BaseModel):
     inserted: int
     skipped_duplicates: int
     provider_counts: Dict[str, int]
 
-def _require_shortcuts_key(header_key: Optional[str]):
+def _require_shortcuts_key(any_header_value: Optional[str]):
+    """
+    Enforce the shared secret if SHORTCUTS_KEY is set in the environment.
+    Accepts X-Shortcuts-Key / x_shortcuts_key / SHORTCUTS_KEY headers.
+    """
     if not SHORTCUTS_KEY:
-        return  # allow missing header if you intentionally didn't set the secret
-    if not header_key or header_key.strip() != SHORTCUTS_KEY:
+        return  # secret disabled -> allow all (useful during local testing)
+    if not any_header_value or any_header_value.strip() != SHORTCUTS_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key")
 
 # ---------- Route ----------
 @app.post("/scrape-and-insert", response_model=ScrapeResult)
 async def scrape_and_insert(
     body: ScrapeRequest,
-    x_shortcuts_key: Optional[str] = Header(default=None, convert_underscores=False),
+    # Accept common spellings for the header:
+    x_shortcuts_key_hyphen: Optional[str] = Header(default=None, alias="X-Shortcuts-Key"),
+    x_shortcuts_key_underscore: Optional[str] = Header(default=None, alias="x_shortcuts_key"),
+    x_shortcuts_key_plain: Optional[str] = Header(default=None, alias="SHORTCUTS_KEY"),
 ):
-    _require_shortcuts_key(x_shortcuts_key)
+    # pick whichever arrived
+    header_key = x_shortcuts_key_hyphen or x_shortcuts_key_underscore or x_shortcuts_key_plain
+    _require_shortcuts_key(header_key)
 
     topic = (body.topic or "").strip()
     if not topic:
@@ -92,9 +105,9 @@ async def scrape_and_insert(
     skipped = 0
     provider_counts: Dict[str, int] = {}
 
-    # columns you want set from request
-    search_topics_used = body.searchTopicsUsed or body.topic
-    search_dates_used = body.searchDatesUsed or body.searchDates or ""
+    # columns you want set from request; prefer explicit “Used”, then raw fields, then topic
+    search_topics_used = (body.searchTopicsUsed or body.searchTopics or body.topic or "").strip()
+    search_dates_used = (body.searchDatesUsed or body.searchDates or "").strip()
 
     tasks = []
 
@@ -113,7 +126,7 @@ async def scrape_and_insert(
     for provider_name, items in results:
         provider_counts.setdefault(provider_name, 0)
         for item in items:
-            fields = {
+            fields: Dict[str, Any] = {
                 "Media Type": item.get("media_type") or ("Images" if want_images else "Videos"),
                 "Provider": provider_name,
                 "Thumbnail": item.get("thumbnail") or "",
@@ -129,10 +142,9 @@ async def scrape_and_insert(
 
             # de-dup by exact Source URL
             src = fields["Source URL"]
-            if src:
-                if find_by_source_url(src):
-                    skipped += 1
-                    continue
+            if src and find_by_source_url(src):
+                skipped += 1
+                continue
 
             insert_row(fields)
             inserted += 1
