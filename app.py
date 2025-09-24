@@ -1,57 +1,30 @@
+import os
+import logging
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
-import os
-import logging
-
 from providers.openverse import search as openverse_search
-from airtable_client import (
-    find_by_source_url,
-    insert_record,  # alias provided in airtable_client for backwards compat
-)
+from airtable_client import insert_record, find_by_source_url
 
 APP_VERSION = "1.0.0"
 
-# Env
 SHORTCUTS_KEY = os.getenv("SHORTCUTS_KEY", "").strip()
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
 
 app = FastAPI(title="media-scrape-backend", version=APP_VERSION)
-
-# ---------- Models ----------
+logging.basicConfig(level=logging.INFO)
 
 class ScrapeRequest(BaseModel):
-    topic: str = Field(..., description="Primary search text")
+    topic: str = Field(..., description="Search query")
     targetCount: int = Field(1, ge=1, le=50)
     providers: List[str] = Field(default_factory=lambda: ["Openverse"])
-    mediaMode: str = Field("Images", description='"Images" or "Audio" (Openverse supports both)')
+    mediaMode: str = Field("Images")
     runId: Optional[str] = None
     searchTopics: Optional[str] = None
     searchDates: Optional[str] = None
-
-
-# ---------- Helpers ----------
-
-def normalize_openverse(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize Openverse record to a consistent schema for Airtable."""
-    return {
-        "source": "openverse",
-        "source_id": item.get("id"),
-        "title": item.get("title") or "",
-        "url": item.get("url") or "",
-        "thumbnail": item.get("thumbnail") or "",
-        "provider": "Openverse",
-    }
-
-
-PROVIDER_MAP = {
-    "Openverse": ("openverse", openverse_search, normalize_openverse),
-    # Add other providers here, e.g. "YouTube": ( "youtube", youtube_search, normalize_youtube )
-}
-
 
 def require_shortcuts_key(key_header: str):
     if not SHORTCUTS_KEY:
@@ -59,13 +32,9 @@ def require_shortcuts_key(key_header: str):
     if key_header != SHORTCUTS_KEY:
         raise HTTPException(status_code=401, detail="Invalid X-Shortcuts-Key")
 
-
 def ensure_airtable_env():
     if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
         raise HTTPException(status_code=500, detail="Airtable env missing")
-
-
-# ---------- Routes ----------
 
 @app.get("/health")
 async def health():
@@ -79,44 +48,58 @@ async def scrape_and_insert(
     require_shortcuts_key(x_shortcuts_key)
     ensure_airtable_env()
 
-    media_mode = (payload.mediaMode or "Images").lower()
+    media_mode = (payload.mediaMode or "Images").strip().lower()
     target = payload.targetCount
+    topic = payload.topic.strip()
 
-    all_rows = []
+    normalized_mode = "Image" if media_mode.startswith("image") else "Video"
+
+    all_rows: List[Dict[str, Any]] = []
     for provider_name in payload.providers:
-        provider = PROVIDER_MAP.get(provider_name)
-        if not provider:
-            # Soft-skip unknown provider rather than 500
-            logging.warning(f"Unknown provider: {provider_name}; skipping")
-            continue
-
-        _, search_fn, normalize_fn = provider
-
         try:
-            items = await search_fn(payload.topic, media_mode, target)
-        except Exception as e:
+            if provider_name == "Openverse":
+                items = await openverse_search(topic, media_mode, target)
+            else:
+                logging.warning(f"Unknown provider: {provider_name}; skipping")
+                continue
+        except Exception:
             logging.exception(f"{provider_name} search failed")
-            # Skip this provider on failure, continue with others
             continue
 
-        for raw in items:
-            row = normalize_fn(raw)
+        for it in items:
+            url = it.get("url") or ""
+            if not url:
+                continue
 
-            # Dedup by source URL in Airtable
+            exists = False
             try:
-                exists = await find_by_source_url(row["url"])
+                exists = await find_by_source_url(url)
             except Exception:
-                exists = False
+                logging.exception("Airtable find_by_source_url failed")
 
             if not exists:
+                fields = {
+                    "Media Type": normalized_mode,
+                    "Provider": provider_name,
+                    "Thumbnail": it.get("thumbnail") or "",
+                    "Title": it.get("title") or "",
+                    "Source URL": url,
+                    "Search Topics Used": payload.searchTopics or topic,
+                    "Search Dates Used": payload.searchDates or "",
+                    "Published/Created": it.get("published") or "",
+                    "Copyright": it.get("copyright") or "",
+                    "Run ID": payload.runId or "",
+                    "Notes": it.get("notes") or "",
+                }
                 try:
-                    await insert_record(row, meta={
-                        "run_id": payload.runId or "",
-                        "provider": provider_name,
-                    })
+                    await insert_record(fields)
                 except Exception:
                     logging.exception("Airtable insert failed")
 
-            all_rows.append(row)
+            all_rows.append({
+                "provider": provider_name,
+                "title": it.get("title") or "",
+                "url": url,
+            })
 
-    return {"insertedOrSkipped": len(all_rows), "providersProcessed": payload.providers}
+    return {"processed": len(all_rows), "providers": payload.providers}
