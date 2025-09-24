@@ -1,23 +1,23 @@
-# Ignore Python cache and build files
+.git
+.gitignore
+.gcloudignore
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
-*.sqlite3
-
-# Virtual environments
 .env
-.venv
-venv/
-ENV/
-
-# Ignore OS files
-.DS_Store
-
-# Git
-.git
-.gitignore
-
-# Other configs not needed in container
+.env.*
 *.log
+.DS_Store
+.vscode/
+.idea/
+node_modules/
+venv/
+.venv/
+build/
+dist/
+*.zip
+*.tar
+*.tgz
+*.sqlite3
+google-cloud-sdk/
