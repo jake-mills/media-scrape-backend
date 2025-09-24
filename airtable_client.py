@@ -40,3 +40,8 @@ def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
         r = client.post(_table_url(), json=payload, headers=HEADERS)
         r.raise_for_status()
         return r.json()
+
+# --- Backwards-compat alias so older code keeps working ---
+def insert_record(*args, **kwargs):
+    """Compatibility alias for older imports."""
+    return insert_row(*args, **kwargs)
