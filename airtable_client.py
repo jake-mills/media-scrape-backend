@@ -1,108 +1,80 @@
-# airtable_client.py
-from __future__ import annotations
-
 import os
-import time
-from typing import Any, Dict, Optional
-from urllib.parse import quote
-
+import asyncio
 import httpx
+from typing import Dict, Any, Optional
 
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "").strip()
 
-# ---- config / env helpers ---------------------------------------------------
+_API = "https://api.airtable.com/v0"
 
-def _require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return val
-
-
-AIRTABLE_API_KEY: str = _require_env("AIRTABLE_API_KEY")
-AIRTABLE_BASE_ID: str = _require_env("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME: str = _require_env("AIRTABLE_TABLE_NAME")  # e.g. 'Videos & Images'
-
-# URL-encode the table name so spaces/& etc. are safe in the path
-_TABLE_NAME_ENC = quote(AIRTABLE_TABLE_NAME, safe="")
-_BASE_URL = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
-
-_HEADERS = {
-    "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-    "Content-Type": "application/json",
-}
-
-_HTTP_TIMEOUT = 20.0
-_MAX_RETRIES = 3
-
+def _auth_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
 
 def _table_url() -> str:
-    return f"{_BASE_URL}/{_TABLE_NAME_ENC}"
+    return f"{_API}/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
 
-
-def _escape_formula_value(val: str) -> str:
-    # Airtable formula literal in single quotes: escape single quotes with backslash
-    return val.replace("'", r"\'") if isinstance(val, str) else val
-
-
-def _request_with_retries(method: str, url: str, **kwargs) -> httpx.Response:
-    """
-    Tiny retry loop for 429/5xx and transient network errors.
-    """
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-                resp = client.request(method, url, headers=_HEADERS, **kwargs)
-            # Raise for non-2xx so we can check status
-            resp.raise_for_status()
-            return resp
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            if status in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES:
-                time.sleep(0.8 * attempt)  # simple backoff
+async def _retryable_get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for attempt in range(3):
+            resp = await client.get(url, headers=_auth_headers(), params=params)
+            if resp.status_code == 200:
+                return resp.json()
+            # 429 / transient 5xx -> retry
+            if resp.status_code in (429, 500, 502, 503, 504):
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            raise
-        except httpx.RequestError:
-            if attempt < _MAX_RETRIES:
-                time.sleep(0.8 * attempt)
+            # hard fail
+            text = await _safe_text(resp)
+            raise RuntimeError(f"Airtable GET failed {resp.status_code}: {text}")
+    return None
+
+async def _retryable_post(url: str, json: Dict[str, Any]) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for attempt in range(3):
+            resp = await client.post(url, headers={**_auth_headers(), "Content-Type":"application/json"}, json=json)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            if resp.status_code in (429, 500, 502, 503, 504):
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            raise
+            text = await _safe_text(resp)
+            raise RuntimeError(f"Airtable POST failed {resp.status_code}: {text}")
+    raise RuntimeError("Airtable POST exhausted retries")
 
+async def _safe_text(resp: httpx.Response) -> str:
+    try:
+        return resp.text
+    except Exception:
+        return "<no text>"
 
-# ---- public helpers ---------------------------------------------------------
+# ---------- Public helpers ----------
 
-def find_by_source_url(url: Optional[str]) -> Optional[Dict[str, Any]]:
+async def find_by_source_url(url: str) -> bool:
     """
-    Return the first record if {Source URL} matches exactly, else None.
+    Returns True if a row exists with field 'url' == url (change field name if you use a different one).
     """
     if not url:
-        return None
-
-    safe = _escape_formula_value(url)
+        return False
     params = {
-        "filterByFormula": f"{{Source URL}}='{safe}'",
+        "filterByFormula": f"{{url}}='{url.replace(\"'\", \"\\'\")}'",
         "maxRecords": 1,
     }
+    data = await _retryable_get(_table_url(), params)
+    records = (data or {}).get("records", [])
+    return len(records) > 0
 
-    r = _request_with_retries("GET", _table_url(), params=params)
-    data = r.json()
-    records = data.get("records", [])
-    return records[0] if records else None
-
-
-def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
+async def insert_row(fields: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Create a single Airtable record. Keys must match column names verbatim.
-    Returns Airtable's created record payload.
+    Inserts one row with the provided fields dict.
     """
-    payload = {"fields": fields}
-    r = _request_with_retries("POST", _table_url(), json=payload)
-    return r.json()
+    payload = {"records":[{"fields": fields}], "typecast": True}
+    return await _retryable_post(_table_url(), payload)
 
-
-# ---- backwards-compat alias -------------------------------------------------
-
-def insert_record(*args, **kwargs):
-    """
-    Compatibility alias so 'from airtable_client import insert_record' keeps working.
-    """
-    return insert_row(*args, **kwargs)
+# Backwards compat: your app imported insert_record earlier
+async def insert_record(fields: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # Optionally merge meta into fields under your schema conventions
+    if meta:
+        fields = {**fields, **{k: v for k, v in meta.items() if v}}
+    return await insert_row(fields)
