@@ -13,13 +13,10 @@ __pycache__/
 node_modules/
 venv/
 .venv/
-google-cloud-sdk/
-.pytest_cache/
-.mypy_cache/
-.coverage
 build/
 dist/
 *.zip
 *.tar
 *.tgz
 *.sqlite3
+google-cloud-sdk/
