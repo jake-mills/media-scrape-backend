@@ -1,2 +1,2 @@
-# providers/__init__.py
-# Empty file to mark this as a package.
+# Make "from providers import openverse" resolve cleanly
+from . import openverse  # noqa: F401
