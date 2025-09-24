@@ -1,5 +1,5 @@
 # Media Scrape Backend (Cloud, Option C+ with Prefilled Base ID + Date Filters)
-FastAPI backend for your Apple Shortcut. Parallel provider fetch (YouTube, Openverse, Internet Archive), URL normalization, Airtable dedupe, **batch insert**, auth header, and Render/Railway blueprints.
+FastAPI backend for an Automated Media Scraping Shortcut. Parallel provider fetch (YouTube, Openverse, Internet Archive), URL normalization, Airtable dedupe, **batch insert**, auth header, and Render/Railway blueprints.
 
 This build includes:
 - `AIRTABLE_BASE_ID` default set to **app7iv7XirA2VzppE** (your base)
